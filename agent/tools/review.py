@@ -76,6 +76,11 @@ def build_diff(changes: Sequence[Dict[str, Any]]) -> str:
     ),
     parameters={"type": "object", "properties": {}},
     category="控制",
+    when_not_to_use=(
+        "要看**某个文件现在的内容**用 read_file，本工具只反映本次会话的改动，"
+        "不读磁盘、也不显示未被本会话碰过的文件。别在每轮结束都调一次，"
+        "在 finish 前调一次自查即可。"
+    ),
 )
 def diff(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     text = build_diff(ctx.session.get("changes", []))

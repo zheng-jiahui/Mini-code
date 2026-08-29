@@ -168,6 +168,22 @@ class ToolSpec:
     dangerous: bool = False      # True 时执行前需按 command_policy 处理
     hidden: bool = False         # True 时不出现在系统提示词的工具清单里
     category: str = "general"
+    when_not_to_use: str = ""    # 反向文档：什么时候不该用它
+
+    def effective_description(self) -> str:
+        """给模型看的完整描述 = 用途 + 使用边界。
+
+        为什么把"不该用它"也喂给模型：工具越多，模型越容易误用——
+        典型如用 write_file 改一个 500 行文件里的一行，既烧 token 又容易在输出
+        上限处被截断（V0 那次 HTTP 400 就是这么来的）。
+        每个工具多几十个字符，换少走一轮弯路，划算。
+
+        注意必须让 **native function calling 通道** 也带上（见 openai_schema）：
+        默认配置下模型读的是 schema 里的 description，只写进系统提示词等于没写。
+        """
+        if not self.when_not_to_use:
+            return self.description
+        return f"{self.description}\n不该用它的情况：{self.when_not_to_use}"
 
     def openai_schema(self) -> Dict[str, Any]:
         """转成 OpenAI function calling 的 schema。"""
@@ -175,7 +191,7 @@ class ToolSpec:
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
+                "description": self.effective_description(),
                 "parameters": self.parameters or {"type": "object", "properties": {}},
             },
         }
@@ -191,8 +207,12 @@ class ToolSpec:
             parts.append(f"{key}{mark}: {t}")
         return f"{self.name}({', '.join(parts)})"
 
-    def doc(self) -> str:
-        return f"- {self.signature()} —— {self.description}"
+    def doc(self, *, with_guardrail: bool = True) -> str:
+        """一行文档。`with_guardrail=False` 时只给签名+用途（省 token 用）。"""
+        line = f"- {self.signature()} —— {self.description}"
+        if with_guardrail and self.when_not_to_use:
+            line += f"\n    ⚠ 不该用：{self.when_not_to_use}"
+        return line
 
 
 def tool_spec(
@@ -203,8 +223,14 @@ def tool_spec(
     dangerous: bool = False,
     hidden: bool = False,
     category: str = "general",
+    when_not_to_use: str = "",
 ) -> Callable[[ToolHandler], ToolSpec]:
-    """装饰器：把普通函数标记为 ToolSpec（函数本身不注册，注册由 registry 完成）。"""
+    """装饰器：把普通函数标记为 ToolSpec（函数本身不注册，注册由 registry 完成）。
+
+    when_not_to_use 是反向文档——写清"什么时候不该用它"。
+    工具描述普遍只写"能干什么"，但agent 出错往往出在"该用 A 却用了 B"，
+    把边界写清楚比把能力吹得更大更有用。
+    """
 
     def deco(fn: ToolHandler) -> ToolSpec:
         spec = ToolSpec(
@@ -215,6 +241,7 @@ def tool_spec(
             dangerous=dangerous,
             hidden=hidden,
             category=category,
+            when_not_to_use=when_not_to_use,
         )
         spec.__doc__ = fn.__doc__ or description
         return spec
@@ -261,15 +288,20 @@ class ToolRegistry:
         """给 OpenAI 接口用的工具 schema 列表。"""
         return [s.openai_schema() for s in self._tools.values() if not s.hidden]
 
-    def describe(self) -> str:
-        """生成给系统提示词用的工具清单文本。"""
+    def describe(self, *, with_guardrail: bool = True) -> str:
+        """生成工具清单文本。
+
+        with_guardrail=True（默认）：带上「不该用」的边界说明，用于 `/tools` 给人看，
+        以及系统提示词——这部分正是防误用的关键，默认带上。
+        False：只留签名+用途，供需要压缩 token 的场景（如上下文压缩后的精简清单）。
+        """
         buckets: Dict[str, List[ToolSpec]] = {}
         for s in self.visible_specs():
             buckets.setdefault(s.category, []).append(s)
         lines = []
         for cat, items in buckets.items():
             lines.append(f"【{cat}】")
-            lines.extend(s.doc() for s in items)
+            lines.extend(s.doc(with_guardrail=with_guardrail) for s in items)
         return "\n".join(lines)
 
     # ---------- 执行 ----------

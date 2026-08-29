@@ -56,6 +56,11 @@ _TEXT_SUFFIX_HINT = {
         "required": ["path"],
     },
     category="文件",
+    when_not_to_use=(
+        "不要为了「看看有什么」就把整个大文件读进来——先 list_dir 看清结构，"
+        "或用 grep_search 直接定位；只读需要改的那一段（offset/limit）。"
+        "二进制文件（图片/压缩包）读出来是乱码，别读。"
+    ),
 )
 def read_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     path = ctx.resolve(args["path"], must_exist=True)
@@ -134,6 +139,11 @@ def _count_lines(path: Path) -> int:
     },
     dangerous=True,
     category="文件",
+    when_not_to_use=(
+        "改一个已存在文件里的少量内容时，不要用 write_file 整体重写——"
+        "长文件会被输出上限截断（V0 的 HTTP 400 就是这么来的），用 edit_block。"
+        "也不要用它做小步追加日志，append=true 更合适。"
+    ),
 )
 def write_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     target = ctx.resolve(args["path"])
@@ -216,6 +226,11 @@ def write_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         "required": ["path", "old_text", "new_text"],
     },
     category="文件",
+    when_not_to_use=(
+        "整篇重写（改动超过文件一半、或结构性重构）时用 write_file 更省事。"
+        "还没 read_file 确认原文就别动手——old_text 靠猜必错。"
+        "连续两次匹配失败就停手重新 read_file，不要靠加转义反复试。"
+    ),
 )
 def edit_block(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     target = ctx.resolve(args["path"], must_exist=True)
@@ -298,6 +313,10 @@ def edit_block(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         "required": [],
     },
     category="文件",
+    when_not_to_use=(
+        "已知文件名要找内容时用 find_files/grep_search，别列一遍目录再猜；"
+        "depth 别开太大（>3 层在 node_modules 类目录里会淹没上下文）。"
+    ),
 )
 def list_dir(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     root = ctx.resolve(args.get("path") or ".", must_exist=True)

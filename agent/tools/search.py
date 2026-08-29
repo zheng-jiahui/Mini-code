@@ -45,6 +45,10 @@ _MAX_FILE_BYTES = 2 * 1024 * 1024  # 跳过大于 2MB 的文件
         "required": ["pattern"],
     },
     category="检索",
+    when_not_to_use=(
+        "已知确切文件名就直接 read_file；要按名字找文件用 find_files。"
+        "别用 .* 这类宽泛模式——命中几百条只会淹没上下文，先用 include 收窄范围。"
+    ),
 )
 def grep_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     pattern = args.get("pattern") or ""
@@ -104,6 +108,10 @@ def grep_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         "required": [],
     },
     category="检索",
+    when_not_to_use=(
+        "要找的是**内容**（函数/报错/配置项）时用 grep_search，本工具只按文件名匹配。"
+        "别用 `*`（全量）去摸清项目结构，那正是 list_dir 的活。"
+    ),
 )
 def find_files(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     root = ctx.resolve(args.get("path") or ".", must_exist=True)

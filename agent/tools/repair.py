@@ -41,6 +41,11 @@ __all__ = ["rollback", "register"]
         },
     },
     category="控制",
+    when_not_to_use=(
+        "只是一次运行失败、且你已经看清报错在哪一行时，直接 edit_block 定向修，"
+        "不要回滚——回滚会丢掉之后的全部改动。它是「修不动了」的退路，不是常规手段；"
+        "只在修复预算快耗尽、代码已被改乱时用。"
+    ),
 )
 def rollback(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     task_name = ctx.session.get("task_name") or ctx.workspace.name

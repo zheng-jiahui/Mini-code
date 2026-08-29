@@ -35,6 +35,10 @@ FINISH_SENTINEL = "__finish__"
     # 只是主循环会对它做特殊处理（直接终止，不把回执喂回模型）。
     hidden=False,
     category="控制",
+    when_not_to_use=(
+        "改动了文件却一次都没验证过时不要收尾——先 run_command 跑一遍；"
+        "也不要在报错还没定位清楚时用它糊弄过去，那不是完成，是逃避。"
+    ),
 )
 def finish(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     summary = (args.get("summary") or "").strip() or "（模型未给出总结）"
@@ -57,6 +61,11 @@ def finish(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         "required": ["question"],
     },
     category="控制",
+    when_not_to_use=(
+        "能通过 read_file/grep_search 自己查清的（现有代码怎么写的、用的什么框架）"
+        "就别问，自己看。也不要一次问一串问题——先问最卡住的那一个；"
+        "已在计划里确认过的决定不要重复问。"
+    ),
 )
 def ask_user(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     question = (args.get("question") or "").strip()

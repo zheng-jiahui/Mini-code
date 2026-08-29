@@ -47,6 +47,11 @@ __all__ = ["run_command", "register"]
     },
     dangerous=True,
     category="执行",
+    when_not_to_use=(
+        "只是读写文件就用 read_file/write_file/edit_block，不必绕道 shell。"
+        "不要跑交互式命令（等待输入的 REPL、需要确认的 `rm -i`）——会卡到超时；"
+        "也不要用一条超长复合命令同时做验证和清理，拆开才能定位是哪一步挂了。"
+    ),
 )
 def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     command = (args.get("command") or "").strip()

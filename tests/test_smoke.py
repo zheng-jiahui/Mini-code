@@ -938,6 +938,40 @@ def test_record_change_marks_command_and_oversize_as_not_captured():
         assert "另有 1 个变更内容过大" in text
 
 
+# ----------------------------------------------------------------------------
+# 追加工作：工具反向文档（when_not_to_use）
+# ----------------------------------------------------------------------------
+def test_every_tool_documents_when_not_to_use_it():
+    """每个面向模型的工具都要写清「什么时候不该用它」。
+
+    工具越多模型越容易误用（典型：用 write_file 整体重写大文件里的一行）。
+    这条断言保证以后加新工具时不会漏掉反向文档。
+    """
+    registry = build_default_registry()
+    missing = [s.name for s in registry.visible_specs() if not s.when_not_to_use.strip()]
+    assert not missing, f"这些工具缺少 when_not_to_use：{missing}"
+
+
+def test_guardrail_reaches_model_on_both_channels():
+    """反向文档必须让模型在**两条通道**上都看到，否则等于没写。
+
+    默认配置走 native function calling，模型读的是 openai_schema 里的 description；
+    只把它写进系统提示词（describe）的话 native 通道根本看不到。
+    """
+    registry = build_default_registry()
+    spec = registry.get("write_file")
+    assert spec is not None
+
+    # ① native function calling 通道
+    schema = spec.openai_schema()
+    assert "不该用它的情况" in schema["function"]["description"]
+
+    # ② 文本协议通道（系统提示词的工具清单）
+    assert "⚠ 不该用" in registry.describe()
+    # 需要压缩时可只要签名+用途
+    assert "⚠ 不该用" not in registry.describe(with_guardrail=False)
+
+
 def test_write_over_huge_file_marks_change_not_captured():
     """覆盖写一个超大文件时，不能把 before="" 当成"原本是空文件"。
 
