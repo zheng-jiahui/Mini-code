@@ -324,6 +324,51 @@ def test_task_name_defaults_to_slug_of_task():
 
 
 # ----------------------------------------------------------------------------
+# 13) 纠错回灌不能破坏消息结构
+# ----------------------------------------------------------------------------
+def test_correction_note_never_puts_system_after_start():
+    """回归：纠错提示若以 system 角色追加到末尾，网关会 400。
+
+    真实报错：`HTTP 400 System message must be at the beginning.`
+    OpenAI 兼容协议要求 system 只能位于消息列表开头。
+    """
+    from agent.history import History
+
+    h = History("系统提示词")
+    h.add_user("写一个前端页面")
+    h.add_note("纠错：write_file 缺少必填参数 path")
+
+    payload = h.payload()
+    assert payload[0]["role"] == "system", "首条必须是 system"
+
+    seen_non_system = False
+    for msg in payload:
+        if msg["role"] == "system":
+            assert not seen_non_system, \
+                f"system 消息出现在非开头位置，会被网关拒绝：{msg['content'][:40]}"
+        else:
+            seen_non_system = True
+
+    # 纠错提示本身应以 user 角色回灌（对模型同样有效，且各家网关都接受）
+    assert payload[-1]["role"] == "user", f"实际：{payload[-1]['role']}"
+    assert "path" in payload[-1]["content"]
+
+    # 该网关比 OpenAI 更严格：连"开头连续两条 system"也 400，故只保留首条
+    h2 = History("系统提示词")
+    h2.messages = [{"role": "system", "content": "系统提示词"},
+                   {"role": "system", "content": "摘要"},
+                   {"role": "user", "content": "继续"}]
+    assert [m["role"] for m in h2.payload()] == ["system", "user", "user"]
+
+    # 中间/末尾出现的 system 同样要降级
+    h3 = History("系统提示词")
+    h3.messages = [{"role": "system", "content": "系统提示词"},
+                   {"role": "user", "content": "hi"},
+                   {"role": "system", "content": "迟到的系统提示"}]
+    assert [m["role"] for m in h3.payload()] == ["system", "user", "user"]
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -118,8 +118,14 @@ class History:
         self._append("tool", item)
 
     def add_note(self, content: str) -> None:
-        """插入系统级提示（纠错、预算提醒、重复调用警告等）。"""
-        self._append("note", {"role": "system", "content": content})
+        """插入一条提示（纠错、预算提醒、重复调用警告等）。
+
+        这里**不能用 role="system"**：OpenAI 兼容协议要求 system 消息位于列表开头，
+        把 system 追加到末尾会让网关直接返回
+        `400 System message must be at the beginning`。改用 user 角色回灌，
+        对模型同样有强引导作用，且各家网关都接受。
+        """
+        self._append("note", {"role": "user", "content": content})
 
     def _append(self, kind: str, item: Dict[str, Any]) -> None:
         self.messages.append(item)
@@ -131,8 +137,19 @@ class History:
         return count_messages_tokens(self.messages)
 
     def payload(self) -> List[Dict[str, Any]]:
-        """发给模型的消息列表。"""
-        return list(self.messages)
+        """发给模型的消息列表。
+
+        防御性处理：除首条外，任何 system 消息都降级为 user。
+        这样即便将来有别的路径插入了 system，也不会触发网关的 400。
+        """
+        # 只允许第 0 条是 system。实测 NSCC 的 new-api 网关比 OpenAI 更严格：
+        # 连"开头连续两条 system"（压缩摘要那种写法）都会返回同样的 400。
+        out: List[Dict[str, Any]] = []
+        for idx, msg in enumerate(self.messages):
+            if idx > 0 and msg.get("role") == "system":
+                msg = {**msg, "role": "user"}
+            out.append(msg)
+        return out
 
     def turn_count(self) -> int:
         return sum(1 for k in self.kinds if k == "user")
@@ -179,7 +196,8 @@ class History:
         if summary is None:  # 硬压缩兜底
             summary = "[历史已截断] 早期对话被丢弃以腾出上下文空间；如需细节请重新读取相关文件。"
 
-        self.messages = [head, {"role": "system", "content": _wrap_summary(summary)}, *tail]
+        # 摘要用 user 角色：网关只接受首条为 system，第 2 条 system 会触发 400
+        self.messages = [head, {"role": "user", "content": _wrap_summary(summary)}, *tail]
         self.kinds = ["system", "note", *self.kinds[tail_start:]]
         self.compact_count += 1
         return True
