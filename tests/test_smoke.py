@@ -1391,6 +1391,18 @@ def test_apply_patch_is_registered_and_visible_to_model():
 
 
 # ----------------------------------------------------------------------------
+# system prompt 内容契约（守护"核心差异点"不被无意改弱）
+# ----------------------------------------------------------------------------
+def test_system_prompt_mentions_clarify_parallel_and_decision_order():
+    from agent.prompts import build_system_prompt  # noqa: E402
+
+    prompt = build_system_prompt(tool_list="- x()", workspace="/tmp/ws", native_tools=True)
+    assert "ask_user" in prompt, "应提示任务含糊时先澄清"
+    assert "并行" in prompt, "应提示可并行的读操作一轮发完"
+    assert "决策顺序" in prompt, "应给出拿不准时的决策顺序"
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
