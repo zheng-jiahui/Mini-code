@@ -228,6 +228,73 @@ def _locate_config(explicit: Optional[str]) -> Optional[Path]:
     return None
 
 
+# 密钥配置文件的搜索顺序（第一个命中的生效）
+_API_KEY_FILE_CANDIDATES: Iterable[str] = (
+    "api_keys.yaml",
+    "api_keys.yml",
+    "api_keys.json",
+)
+
+
+def _locate_api_keys() -> Optional[Path]:
+    """定位密钥配置文件：环境变量 AGENT_API_KEYS > 当前目录候选 > 项目根目录。"""
+    env_path = os.environ.get("AGENT_API_KEYS")
+    if env_path and Path(env_path).expanduser().exists():
+        return Path(env_path).expanduser().resolve()
+
+    here = Path(__file__).resolve().parent.parent
+    for name in _API_KEY_FILE_CANDIDATES:
+        for base in (Path.cwd(), here):
+            cand = base / name
+            if cand.exists():
+                return cand.resolve()
+    return None
+
+
+def _load_api_keys() -> Optional[Path]:
+    """把密钥配置文件中的条目注入环境变量，供 `${VAR}` 占位符展开时使用。
+
+    采用 `setdefault`，因此**系统环境变量优先级高于本文件**：已 export 的同名
+    变量不会被文件里的值覆盖。这样 config.yaml 里写 `${NSCC_API_KEY}` 就能
+    同时兼容两种提供方式：终端环境变量、或 api_keys.yaml 配置文件。
+
+    注意：密钥文件已在 .gitignore 中，仓库里只有模板 api_keys.example.yaml。
+    空值（"" 或 null）条目会被跳过，不会污染环境。
+    """
+    path = _locate_api_keys()
+    if path is None:
+        return None
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    if path.suffix.lower() == ".json":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    else:
+        if yaml is None:  # 没有 PyYAML 就跳过，退化为纯环境变量模式
+            return None
+        try:
+            data = yaml.safe_load(text)
+        except Exception:
+            return None
+
+    if not isinstance(data, dict):
+        return None
+
+    for name, value in data.items():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue  # 模板文件里的空条目：跳过
+        os.environ.setdefault(name.strip(), str(value).strip())
+    return path
+
+
 # ----------------------------------------------------------------------------
 # 主入口
 # ----------------------------------------------------------------------------
@@ -252,6 +319,9 @@ def load_config(
     Raises:
         ConfigError: 配置非法（缺 API key、workspace 不存在、档位不存在等）。
     """
+    # 先把 api_keys.yaml 中的凭据注入环境变量，这样下面 _read_raw 展开 ${...} 时才能取到值。
+    _load_api_keys()
+
     path = _locate_config(explicit)
     raw: Dict[str, Any] = _read_raw(path) if path else {}
 

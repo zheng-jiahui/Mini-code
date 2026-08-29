@@ -3,6 +3,10 @@ config.yaml
 config.yml
 config.local.yaml
 config.local.json
+# 密钥专用配置文件：真实凭据集中放这里，入库的只有模板 api_keys.example.yaml
+api_keys.yaml
+api_keys.yml
+api_keys.json
 # 本地一键启动脚本（内含密钥读取逻辑）
 start.py
 .env
