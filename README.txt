@@ -16,7 +16,7 @@
    workplace/任务名/                          该任务的最新代码
    .agent_backups/任务名_时间戳_第N次/        每次生成的完整归档，序号自动递增
    .overwrites/                              覆盖写单文件备份，供 /undo 回滚
-5) 测试：python tests/test_smoke.py（59 个用例，无需 API key）
+5) 测试：python tests/test_smoke.py（64 个用例，无需 API key）
         python tests/test_fake_server.py（本地假服务端，验证 HTTP 协议链路）
 
 二、特色功能
@@ -24,7 +24,7 @@
    仅用 OpenAI 兼容聊天补全客户端；对话历史、工具、解析、循环、压缩、错误全部自写。
 2. 双通道工具调用：优先原生 function calling；模型/网关不支持时自动切换 ```json 文本协议 + 自写解析校验纠错。
 3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环；含
-   read_file / write_file / edit_block / list_dir / run_command / grep_search /
+   read_file / write_file / edit_block / apply_patch / list_dir / run_command / grep_search /
    find_files / diff / plan / finish / ask_user / rollback。
 4. 上下文治理：tiktoken 精确 token 计数 + 工具回执智能压缩（信号行优先）+ 超阈值摘要压缩兜底；
    /stats 面板报真实 token、各工具耗时占比与时间去向（实测等模型约九成，瓶颈一目了然）。
@@ -37,6 +37,8 @@
 10. 可审阅性：/diff 查看本次会话的 unified diff；rollback 支持单文件级回退（只恢复指定文件）。
 11. 自主性增强：自动识别项目画像（语言/框架/构建/测试命令）注入提示词，让模型先看清新项目再动手；
    plan 工具支持复杂任务"先列计划再执行"；一轮内的多个只读调用（read/grep/list/diff）并行发出，缩短等待。
+12. 改动落地更全：apply_patch 工具把标准 unified diff 落到已存在文件（多 hunk、上下文匹配容错、
+   任一 hunk 对不上即整体失败不写盘），不依赖外部 patch/git 二进制；diff 工具与之配合可"先看改动再打补丁"。
 
 三、其它
 - 架构图、System Prompt、工具规范、接口与错误分层见 docs/DESIGN.md。

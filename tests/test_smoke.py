@@ -1326,6 +1326,71 @@ def test_parallel_readonly_calls_execute():
 
 
 # ----------------------------------------------------------------------------
+# apply_patch（新能力：把 unified diff 落到已存在文件）
+# ----------------------------------------------------------------------------
+def test_apply_patch_changes_adds_and_removes_lines():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, ctx = _make_env(tmp)
+        p = Path(tmp, "calc.py")
+        p.write_text("def f(x):\n    return x + 1\n", encoding="utf-8")
+
+        # 改一行 + 新增一行（同一 hunk）
+        patch = "@@ -1,2 +1,3 @@\n def f(x):\n+    # 加了注释\n     return x + 1\n"
+        res = registry.execute("apply_patch", {"path": "calc.py", "patch": patch}, ctx)
+        assert res.ok, res.error
+        assert "加了注释" in p.read_text(encoding="utf-8")
+
+        # 删除一行
+        patch2 = "@@ -1,3 +1,2 @@\n def f(x):\n     # 加了注释\n-    return x + 1\n"
+        res2 = registry.execute("apply_patch", {"path": "calc.py", "patch": patch2}, ctx)
+        assert res2.ok, res2.error
+        assert "return x + 1" not in p.read_text(encoding="utf-8")
+
+
+def test_apply_patch_multiple_hunks():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, ctx = _make_env(tmp)
+        p = Path(tmp, "nums.txt")
+        p.write_text("1\n2\n3\n4\n5\n", encoding="utf-8")
+        patch = (
+            "@@ -2,1 +2,1 @@\n-2\n+two\n"
+            "@@ -4,1 +4,1 @@\n-4\n+four\n"
+        )
+        res = registry.execute("apply_patch", {"path": "nums.txt", "patch": patch}, ctx)
+        assert res.ok, res.error
+        assert p.read_text(encoding="utf-8") == "1\ntwo\n3\nfour\n5\n"
+
+
+def test_apply_patch_fails_when_hunk_not_found_and_keeps_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, ctx = _make_env(tmp)
+        p = Path(tmp, "x.txt")
+        p.write_text("hello\nworld\n", encoding="utf-8")
+        patch = "@@ -1,2 +1,2 @@\n-zzz\n+abc\n"
+        res = registry.execute("apply_patch", {"path": "x.txt", "patch": patch}, ctx)
+        assert not res.ok
+        # 文件未被改成半成品
+        assert p.read_text(encoding="utf-8") == "hello\nworld\n"
+
+
+def test_apply_patch_rejects_new_file_and_unknown_target():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, ctx = _make_env(tmp)
+        res = registry.execute("apply_patch", {"path": "nope.py",
+                                                "patch": "@@ -1,0 +1,1 @@\n+new\n"}, ctx)
+        assert not res.ok  # 文件不存在应失败而非新建
+
+
+def test_apply_patch_is_registered_and_visible_to_model():
+    registry = build_default_registry()
+    assert "apply_patch" in registry.names()
+    desc = registry.describe()
+    assert "apply_patch" in desc
+    schemas = [s["function"]["name"] for s in registry.schemas()]
+    assert "apply_patch" in schemas
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
