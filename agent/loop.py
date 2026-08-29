@@ -195,6 +195,8 @@ class AgentLoop:
         self._total_tool_calls = 0
         self._output_compressions = 0     # 工具回执因超长被智能压缩的次数
         self._session_started = time.time()
+        self._model_time = 0.0            # 累计「等模型」的时间（通常是最大的一块）
+        self._model_calls = 0
 
     # ------------------------------------------------------------------
     # 任务级工作区
@@ -463,25 +465,31 @@ class AgentLoop:
         没有 console（如单测）或关掉流式时，仍走原来的整包路径。
         """
         tools = self.registry.schemas() if self.native else None
-        if not self.console:
-            return self.backend.chat(self.history.payload(), tools=tools)
+        # 用 finally 计时：失败的请求同样消耗了时间，不该从"时间去向"里消失
+        started = time.perf_counter()
+        try:
+            if not self.console:
+                return self.backend.chat(self.history.payload(), tools=tools)
 
-        if getattr(self.config, "stream", True):
-            self.console.stream_begin(self.profile.model)
-            # 记下本轮流式吐出的正文，供后面判断"思考"提示是否属于重复输出
+            if getattr(self.config, "stream", True):
+                self.console.stream_begin(self.profile.model)
+                # 记下本轮流式吐出的正文，供后面判断"思考"提示是否属于重复输出
+                self._streamed_text = ""
+
+                def _on_delta(chunk: str) -> None:
+                    self._streamed_text += chunk
+                    self.console.stream(chunk)
+
+                msg = self.backend.chat(self.history.payload(), tools=tools, on_delta=_on_delta)
+                self.console.stream_end()
+                return msg
             self._streamed_text = ""
 
-            def _on_delta(chunk: str) -> None:
-                self._streamed_text += chunk
-                self.console.stream(chunk)
-
-            msg = self.backend.chat(self.history.payload(), tools=tools, on_delta=_on_delta)
-            self.console.stream_end()
-            return msg
-        self._streamed_text = ""
-
-        with self.console.spinner(f"调用 {self.profile.model}"):
-            return self.backend.chat(self.history.payload(), tools=tools)
+            with self.console.spinner(f"调用 {self.profile.model}"):
+                return self.backend.chat(self.history.payload(), tools=tools)
+        finally:
+            self._model_time += time.perf_counter() - started
+            self._model_calls += 1
 
     def _narration_already_streamed(self, narration: Optional[str]) -> bool:
         """本轮的正文是否已经通过流式逐字打印过。
@@ -748,8 +756,25 @@ class AgentLoop:
                  f"    total      = {u.get('total_tokens', 0):,}",
                  f"  当前上下文估算：{self.history.tokens:,} tokens（计数方式：{token_counter_name()}）",
                  f"  会话耗时：{time.time() - self._session_started:.1f}s",
-                 f"  工具调用总数：{self._total_tool_calls}",
+                 f"  工具调用总数：{self._total_tool_calls}    模型调用次数：{self._model_calls}",
                  f"  上下文压缩次数：{self.history.compact_count}    回执智能压缩次数：{self._output_compressions}"]
+
+        # 时间去向：回答"瓶颈在哪"。原先只统计工具耗时，而等模型通常是最大的一块，
+        # 不把它算进来，这个面板就答不出"时间花在哪"——只能看到局部。
+        elapsed = time.time() - self._session_started
+        tool_time = sum(self._tool_timings.values())
+        model_time = self._model_time
+        other = max(0.0, elapsed - model_time - tool_time)   # 解析 / 上下文压缩 / 调度
+        if elapsed > 0:
+            def _pct(t: float) -> str:
+                return f"{t / elapsed * 100:5.1f}%"
+            lines.append("  时间去向（瓶颈在哪）：")
+            lines.append(f"    等模型       {model_time:7.2f}s  {_pct(model_time)}")
+            lines.append(f"    执行工具     {tool_time:7.2f}s  {_pct(tool_time)}")
+            lines.append(f"    其它（解析/压缩/调度）{other:7.2f}s  {_pct(other)}")
+            if tool_time > 0 and model_time > tool_time:
+                lines.append(f"    → 结论：瓶颈在模型调用（是工具执行的 {model_time / tool_time:.1f} 倍），"
+                             "优化应优先减少轮数与上下文长度，而非优化工具本身。")
         if self._tool_timings:
             total_t = sum(self._tool_timings.values())
             lines.append("  各工具耗时占比：")

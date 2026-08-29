@@ -1141,6 +1141,34 @@ def test_run_command_survives_absurd_timeout_and_reports_partial_output():
         assert r.meta["timed_out"] is True
 
 
+def test_stats_panel_breaks_down_where_time_went():
+    """「时间去向」必须把等模型的时间算进来，否则答不出瓶颈在哪。
+
+    原先只统计工具耗时，而等模型通常是最大的一块——面板因此只能看到局部，
+    优化方向也会被误导（以为该优化工具，实际该减少轮数与上下文长度）。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        script = [
+            {"content": "写文件。", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "a.py", "content": "x = 1\n"}}]},
+            {"content": "跑一下。", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "echo hi"}}]},
+            {"content": "完成。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "ok"}}]},
+        ]
+        backend, profile = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        loop.run("写文件并运行")
+
+        assert loop._model_calls == 3, "三轮任务应有三次模型调用"
+        assert loop._model_time >= 0
+        panel = loop.build_stats_panel()
+        assert "时间去向" in panel
+        assert "等模型" in panel and "执行工具" in panel and "其它" in panel
+        assert "模型调用次数：3" in panel
+
+
 def test_guardrail_reaches_model_on_both_channels():
     """反向文档必须让模型在**两条通道**上都看到，否则等于没写。
 
