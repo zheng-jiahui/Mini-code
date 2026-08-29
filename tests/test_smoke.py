@@ -2002,6 +2002,59 @@ _CORRECT_SOLUTIONS = {
             "    def put(self, k, v):\n        if k in self.d:\n            self.d.move_to_end(k)\n"
             "        self.d[k] = v\n        if len(self.d) > self.cap:\n"
             "            self.d.popitem(last=False)\n"},
+
+    # ---- V11 新增任务的参考解 ------------------------------------------------
+    "findkw": {"find_kw.py":
+               "import sys\n"
+               "path, kw = sys.argv[1], sys.argv[2]\n"
+               "hits = []\n"
+               "for i, line in enumerate(open(path, encoding='utf-8'), 1):\n"
+               "    if kw in line.rstrip('\\n'):\n"
+               "        hits.append(f'{i}:{line.rstrip()}')\n"
+               "print('\\n'.join(hits) if hits else '无匹配')\n"},
+    "wordfreq": {"wordfreq.py":
+                 "import collections, re\n"
+                 "c = collections.Counter()\n"
+                 "for line in open('article.txt', encoding='utf-8'):\n"
+                 "    for w in re.findall(r'[A-Za-z]+', line):\n"
+                 "        c[w.lower()] += 1\n"
+                 "for w, n in c.most_common(3):\n"
+                 "    print(w, n)\n"},
+    "flatten": {"flatten.py":
+                "def flatten(items):\n    out = []\n    for x in items:\n"
+                "        if isinstance(x, list):\n            out.extend(flatten(x))\n"
+                "        else:\n            out.append(x)\n    return out\n"},
+    "bank": {"account.py":
+             "class Account:\n    def __init__(self, name, balance=0):\n"
+             "        self.name = name\n        self.balance = balance\n"
+             "    def deposit(self, amount):\n        self.balance += amount\n"
+             "    def withdraw(self, amount):\n"
+             "        if amount > self.balance:\n"
+             "            raise ValueError('insufficient balance')\n"
+             "        self.balance -= amount\n",
+             "bank.py":
+             "from account import Account\n"
+             "class Bank:\n    def __init__(self):\n        self.accounts = {}\n"
+             "    def open(self, name, balance=0):\n"
+             "        a = Account(name, balance)\n        self.accounts[name] = a\n"
+             "        return a\n"
+             "    def get(self, name):\n        return self.accounts[name]\n"
+             "    def transfer(self, src, dst, amount):\n"
+             "        s, d = self.accounts[src], self.accounts[dst]\n"
+             "        if amount > s.balance:\n            raise ValueError('insufficient')\n"
+             "        s.withdraw(amount)\n        d.deposit(amount)\n"
+             "    def total(self):\n"
+             "        return sum(a.balance for a in self.accounts.values())\n"},
+    "parselog": {"parselog.py":
+                 "import re\n"
+                 "errs = []\n"
+                 "for line in open('server.log', encoding='utf-8'):\n"
+                 "    m = re.match(r'\\d{4}-\\d{2}-\\d{2} (\\d{2}:\\d{2}:\\d{2}) (\\w+)\\s+(.*)$',"
+                 " line.rstrip('\\n'))\n"
+                 "    if m and m.group(2) == 'ERROR':\n"
+                 "        errs.append(m.group(1) + ' ' + m.group(3))\n"
+                 "print('ERROR 条数:', len(errs))\n"
+                 "for e in errs:\n    print(e)\n"},
 }
 
 _BROKEN_SOLUTIONS = {
@@ -2018,6 +2071,56 @@ _BROKEN_SOLUTIONS = {
                       "        self.cap = capacity\n        self.d = {}\n"
                       "    def get(self, k):\n        return self.d.get(k, -1)\n"
                       "    def put(self, k, v):\n        self.d[k] = v\n"},     # 不淘汰
+
+    # ---- V11 新增任务的错误解（每一条都是"看起来像、其实错"的真实写法）----
+    # findkw：行号从 0 开始（经典 off-by-one，输出看着完全合理）
+    "findkw": {"find_kw.py":
+               "import sys\n"
+               "path, kw = sys.argv[1], sys.argv[2]\n"
+               "hits = []\n"
+               "for i, line in enumerate(open(path, encoding='utf-8')):\n"
+               "    if kw in line.rstrip('\\n'):\n"
+               "        hits.append(f'{i}:{line.rstrip()}')\n"
+               "print('\\n'.join(hits) if hits else '无匹配')\n"},
+    # wordfreq：不做归一化，'Apple,' 被当成独立词
+    "wordfreq": {"wordfreq.py":
+                 "import collections\n"
+                 "c = collections.Counter()\n"
+                 "for line in open('article.txt', encoding='utf-8'):\n"
+                 "    c.update(line.split())\n"
+                 "for w, n in c.most_common(3):\n    print(w, n)\n"},
+    # flatten：只展平一层，深嵌套用例会露馅
+    "flatten": {"flatten.py":
+                "def flatten(items):\n    out = []\n    for x in items:\n"
+                "        if isinstance(x, list):\n            out.extend(x)\n"
+                "        else:\n            out.append(x)\n    return out\n"},
+    # bank：transfer 不校验余额，失败转账会把余额扣成负数
+    "bank": {"account.py":
+             "class Account:\n    def __init__(self, name, balance=0):\n"
+             "        self.name = name\n        self.balance = balance\n"
+             "    def deposit(self, amount):\n        self.balance += amount\n"
+             "    def withdraw(self, amount):\n        self.balance -= amount\n",
+             "bank.py":
+             "from account import Account\n"
+             "class Bank:\n    def __init__(self):\n        self.accounts = {}\n"
+             "    def open(self, name, balance=0):\n"
+             "        a = Account(name, balance)\n        self.accounts[name] = a\n"
+             "        return a\n"
+             "    def get(self, name):\n        return self.accounts[name]\n"
+             "    def transfer(self, src, dst, amount):\n"
+             "        self.accounts[src].balance -= amount\n"
+             "        self.accounts[dst].balance += amount\n"
+             "    def total(self):\n"
+             "        return sum(a.balance for a in self.accounts.values())\n"},
+    # parselog：不过滤级别，把 WARN/INFO 也一起输出
+    "parselog": {"parselog.py":
+                 "import re\n"
+                 "errs = []\n"
+                 "for line in open('server.log', encoding='utf-8'):\n"
+                 "    m = re.match(r'\\S+ (\\S+) \\w+\\s+(.*)$', line.rstrip('\\n'))\n"
+                 "    if m:\n        errs.append(m.group(1) + ' ' + m.group(2))\n"
+                 "print('ERROR 条数:', len(errs))\n"
+                 "for e in errs:\n    print(e)\n"},
 }
 
 
@@ -2050,6 +2153,87 @@ def test_eval_verifiers_reject_broken_solutions():
     for name in _BROKEN_SOLUTIONS:
         ok, msg = _verify_with(name, _BROKEN_SOLUTIONS[name])
         assert not ok, f"{name} 的错误实现被误放行，验证器区分度不足"
+
+
+def test_every_task_has_both_reference_solutions():
+    """每个任务都必须同时备好"正确解"和"错误解"两份参考实现。
+
+    这是**防静默跳过**的一条：上面两条区分度测试是 `for name in _CORRECT_SOLUTIONS`
+    这样遍历字典的——新增任务时若忘了配参考解，循环只是少转一圈，
+    测试照样全绿，而新任务的验证器可能根本没被检验过。
+    这类"什么都不测却报通过"的缺口，比测试失败更危险。
+    """
+    from agent.eval import TASKS
+    names = {t.name for t in TASKS}
+    assert names == set(_CORRECT_SOLUTIONS), (
+        f"缺正确参考解：{sorted(names - set(_CORRECT_SOLUTIONS))}"
+        f"；多出：{sorted(set(_CORRECT_SOLUTIONS) - names)}")
+    assert names == set(_BROKEN_SOLUTIONS), (
+        f"缺错误参考解：{sorted(names - set(_BROKEN_SOLUTIONS))}")
+
+
+def test_cli_verifier_rejects_hardcoded_output():
+    """CLI 类任务必须换参数跑多组，否则"把答案硬编码 print 出来"就能通过。
+
+    这条测的是验证器本身的防作弊能力：单独喂一组参数时，
+    一个完全不解析 argv、直接 print 期望文本的脚本应当也能骗过验证器——
+    那就说明验证器没在测 CLI 契约。多组参数是唯一的低成本防线。
+    """
+    from agent.eval import TASKS
+    task = next(t for t in TASKS if t.name == "findkw")
+    # 硬编码解：不读 argv，直接把 "fix" 那组的期望输出写死
+    hardcoded = {"find_kw.py": "print('2:fix: login timeout on slow network')\n"
+                               "print('4:fix: crash when file is missing')\n"}
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        for rel, content in task.files.items():
+            (d / rel).write_text(content, encoding="utf-8")
+        for rel, content in hardcoded.items():
+            (d / rel).write_text(content, encoding="utf-8")
+        ok, _msg = task.verify(d)
+    assert not ok, "硬编码输出的脚本被放行了，多组参数没起到防作弊作用"
+
+
+def test_eval_task_suite_covers_distinct_dimensions():
+    """任务集不能靠"多出几道同类型题"把样本量灌大。
+
+    10 个任务应当是 10 个维度。这条只守住最粗的一条：考察点说明两两不同
+    （真正是否同质还得靠人读 prompt），但它能挡住最省事的那种灌水——
+    复制一个任务换个名字。
+    """
+    from agent.eval import TASKS
+    intents = [t.intent for t in TASKS]
+    assert len(intents) == len(set(intents)), "存在考察点完全相同的任务，属于重复计数"
+    assert len(intents) >= 10, f"任务数 {len(intents)}，样本仍偏小"
+
+
+def test_eval_report_aligns_cjk_columns_by_display_width():
+    """报告表格要按**显示宽度**对齐，不能按字符数。
+
+    报告是要贴进答辩材料的。`f'{s:<26}'` 按字符数补齐，而 CJK 在终端里占两列，
+    含中文的那一列会整体错位、后面的数字全糊在一起——表格读不了，数字就等于没有。
+    这条钉住按 East Asian Width 计算宽度（W/F 记 2 列）的行为。
+    """
+    from agent.eval import _disp_width, _pad, EvalOutcome, render_report
+
+    assert _disp_width("abc") == 3
+    assert _disp_width("整理") == 4, "CJK 应按 2 列计宽"
+    assert _disp_width("a，b") == 4, "全角标点（U+FF0C，分类 F）同样占 2 列"
+
+    # 中英混排时，补出来的字符串显示宽度必须一致
+    a, b = _pad("整理", 10), _pad("abcdefghij", 10)
+    assert _disp_width(a) == _disp_width(b) == 10
+    assert _disp_width(_pad("十二个字符的中文考察点说明很长很长", 10)) <= 10, "超宽要截断且不越界"
+
+    # 端到端：含中文考察点的表格，分隔线之后每行长度应一致
+    report = render_report([
+        EvalOutcome("lru", "数据结构：带淘汰策略的缓存（容量满时淘汰最久未用）", "finish", 5, 5, 0, 7.6, 900, True, "通过"),
+        EvalOutcome("abc", "short ascii intent", "finish", 5, 5, 0, 7.6, 900, True, "通过"),
+    ], model="m", elapsed=15.0)
+    rows = [ln for ln in report.splitlines() if ln.strip().startswith(("lru", "abc"))]
+    assert len(rows) == 2
+    widths = [_disp_width(r) for r in rows]
+    assert len(set(widths)) == 1, f"两行显示宽度不一致，表格会错位：{widths}"
 
 
 def test_eval_report_separates_self_claim_from_artifact():

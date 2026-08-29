@@ -8,8 +8,8 @@
 为什么需要它
 ------------
 单测证明"零件没坏"，评测回答的是另一个问题：**这些零件装起来能不能干成活**。
-答辩时最有说服力的从来不是"我有 90 个测试"，而是"我在 5 个标准任务上跑下来，
-产物验证通过率 4/5，失败的那个原因是 X"。后者才是能力证据。
+答辩时最有说服力的从来不是"我有 90 个测试"，而是"我在 10 个标准任务上跑下来，
+产物验证通过率 8/10，失败的那两个原因是 X"。后者才是能力证据。
 
 核心设计：以产物为准，不以模型自述为准
 --------------------------------------
@@ -28,18 +28,30 @@
 · 自述失败但验证通过 = 悲观失败（能力被低估，通常是模型过于保守不敢收尾）
 这两类的数量和占比，比单一成功率更能说明问题出在哪。
 
-任务设计的三条约束
+任务设计的四条约束
 ------------------
 1. **只用标准库**：不引入第三方依赖，避免把"环境装没装对"混进能力评分。
 2. **可判定**：每个任务自带 verify()，喂确定输入、比对确定输出，不靠人工看。
-3. **有梯度**：覆盖新建 / 修 bug / 读数据处理 / 算法 / 数据结构五类，
-   难度递增，这样失败在哪一档是有信息量的（"只会新建、修不了 bug"是一句有效诊断）。
+3. **每个任务考察一个此前没考察过的维度**：10 个任务 = 10 个维度，而不是
+   10 道同一道题。加任务之前先问"它比现有的多测了什么"——如果答不上来，
+   那只是把样本量灌大，报告里的通过率会变好看，信息量却没增加。
+4. **每个任务的验证器都要过自检**：一份"正确参考解"必须放行、一份
+   "看起来像但其实错的解"必须拦下。这是硬要求，见 tests 里的两条测试。
+   一个恒为真的验证器不会报错，只会安静地给出 100% 通过率——比没有验证器更危险。
+
+当前 10 个维度（失败在哪一档是有信息量的诊断，例如"只会新建、修不了 bug"）：
+    新建+异常边界 / 修 bug / 读数据出报表 / 算法（保序去重） / 数据结构（LRU 淘汰）
+    / CLI 参数契约 / 非结构化文本→结构化统计 / 递归嵌套结构 / 跨模块协作与状态一致性
+    / 日志抽取与过滤
 
 局限（如实写）
 --------------
-· 5 个任务样本太小，结论只能说明"在这些任务上"，不能外推成通用能力。
+· 10 个任务样本仍然不大，结论只能说明"在这些任务上"，不能外推成通用能力。
 · verify 只能验证接口行为，验证不了代码质量（命名、结构、是否有多余注释）。
 · 真实端点有随机性，单次结果可能波动；要看趋势应多次运行取分布。
+· 评测不检查"过程是否合理"——靠碰运气跑通的也会得满分。
+· 任务全部是"从零写小模块"，不含真实工程里的长上下文改造（读几千行代码后
+  改一处），这类能力目前只能靠长任务实测来佐证。
 """
 
 from __future__ import annotations
@@ -52,6 +64,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -149,6 +162,75 @@ def _has_number(target: float, tol: float = 0.05):
     return _fn
 
 
+def _run_cli(cwd: Path, script: str, args: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
+    """在任务目录里以给定参数运行产物脚本。"""
+    return subprocess.run(
+        [_PY, script, *args], cwd=str(cwd), capture_output=True, text=True,
+        timeout=timeout, encoding="utf-8", errors="replace", env=_child_env(),
+    )
+
+
+def _check_cli(script: str, cases, timeout: int = 30) -> Callable[[Path], Tuple[bool, str]]:
+    """生成一个验证器：用**多组**命令行参数运行产物，逐组检查标准输出。
+
+    为什么必须多组参数：只喂一组参数时，"把答案硬编码进脚本"就能通过——
+    脚本什么都不解析、直接 `print` 出期望文本，验证器一样满意。
+    而 CLI 契约的本质恰恰是**输入变，输出跟着变**；不换输入就测不出这一点。
+    换几组参数是最便宜、也最容易实现的防硬编码手段。
+    """
+    def _verify(task_dir: Path) -> Tuple[bool, str]:
+        for args, expects in cases:
+            try:
+                r = _run_cli(task_dir, script, args, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return False, f"运行超时（参数：{' '.join(args)}）"
+            if r.returncode != 0:
+                tail = (r.stderr or "").strip().splitlines()
+                return False, (f"退出码 {r.returncode}（参数：{' '.join(args)}）："
+                               f"{tail[-1][:160] if tail else '无输出'}")
+            out = r.stdout or ""
+            for label, fn in expects:
+                if not fn(out):
+                    return False, (f"参数 {' '.join(args)} 输出不符（{label}）："
+                                   f"{out.strip()[:200]!r}")
+        return True, "多组参数下输出均正确"
+    return _verify
+
+
+def _line_numbers(out: str) -> set:
+    """抽取输出里所有形如 `12:内容` 的行号（行首数字 + 冒号）。"""
+    return {int(m) for m in re.findall(r"(?m)^\s*(\d+)\s*:", out or "")}
+
+
+def _has_line(out: str, *parts: str) -> bool:
+    """输出里存在某一行，同时包含所有给定片段。"""
+    return any(all(p in ln for p in parts) for ln in (out or "").splitlines())
+
+
+def _first_nonempty_line(out: str) -> str:
+    for ln in (out or "").splitlines():
+        if ln.strip():
+            return ln
+    return ""
+
+
+def _pair_line(word: str, count: int):
+    """输出中存在某一行**同时**包含该词与该数字。
+
+    用于词频这类"词 → 次数"的配对输出：只要求"同一个词和它的次数出现在同一行"，
+    而不规定写成 `apple 4` 还是 `apple: 4` 还是 `apple 出现了 4 次`。
+    措辞不该成为评分项，我们只关心**配得对不对**。
+    """
+    def _fn(out: str) -> bool:
+        w = word.lower()
+        for line in (out or "").splitlines():
+            low = line.lower()
+            if w in low and re.search(rf"(?<!\d){count}(?!\d)", low):
+                return True
+        return False
+    return _fn
+
+
 # ----------------------------------------------------------------------------
 # 任务定义
 # ----------------------------------------------------------------------------
@@ -164,7 +246,7 @@ class EvalTask:
 TASKS: List[EvalTask] = [
     EvalTask(
         name="calc",
-        intent="新建文件 + 边界条件（除 0 抛异常）",
+        intent="新建文件 + 除 0 边界",
         prompt=(
             "在工作区新建 `calc.py`，实现四个纯函数：add(a, b)、sub(a, b)、mul(a, b)、div(a, b)。\n"
             "要求：div 在除数为 0 时必须抛出 ValueError（不要返回 None 或 inf），"
@@ -185,7 +267,7 @@ except ValueError:
     ),
     EvalTask(
         name="fixbug",
-        intent="读已有代码 → 定位缺陷 → 修好并验证（修 bug 能力）",
+        intent="读代码 → 定位 → 修 bug",
         prompt=(
             "工作区已有 `stats.py`，其中 average 函数算出来的结果不对："
             "average([1, 2, 3]) 应该得到 2.0，但现在算错了。\n"
@@ -213,7 +295,7 @@ assert stats.total([1, 2, 3]) == 6, 'total 不该被改坏'
     ),
     EvalTask(
         name="csvreport",
-        intent="读外部数据文件 → 处理 → 按格式输出结果",
+        intent="读 CSV → 算指标 → 出报表",
         prompt=(
             "工作区已有 `scores.csv`（含表头 `姓名,分数`，共 4 行数据）。\n"
             "请新建 `report.py`：读取该 CSV，计算所有分数的平均分（保留一位小数）与最高分，"
@@ -229,7 +311,7 @@ assert stats.total([1, 2, 3]) == 6, 'total 不该被改坏'
     ),
     EvalTask(
         name="dedup",
-        intent="算法：去重但保持首次出现顺序，且不修改入参",
+        intent="保序去重 + 不改入参",
         prompt=(
             "新建 `dedup.py`，实现 `dedup(items)`：去掉重复元素，但**保持每个元素首次出现的顺序**，"
             "返回一个新列表，不得修改传入的原列表。\n"
@@ -246,7 +328,7 @@ assert src == [1, 1, 2], '不该修改入参'
     ),
     EvalTask(
         name="lru",
-        intent="数据结构：带淘汰策略的缓存（容量满时淘汰最久未用）",
+        intent="LRU 缓存：满时淘汰最久未用",
         prompt=(
             "新建 `lru.py`，实现 `LRUCache` 类：\n"
             "- `LRUCache(capacity)` 构造，capacity 是容量；\n"
@@ -274,6 +356,153 @@ assert c.get(3) == -1, '应淘汰最久未用的键 3'
 assert c.get(1) == 1, '1 仍应命中'
 assert c.get(4) == 4, '4 应命中'
 """),
+    ),
+
+    # ---- 以下 5 个任务各自补一个此前没考察过的维度 --------------------------
+    EvalTask(
+        name="findkw",
+        intent="CLI 契约：换参数换输出",
+        prompt=(
+            "新建 `find_kw.py`，作为命令行工具使用：`python find_kw.py <文件路径> <关键字>`。\n"
+            "它打印文件中所有包含该关键字的行，每行格式为 `行号:该行原文`（行号从 1 开始，"
+            "冒号后直接接原文）。一个都匹配不到时，输出一行 `无匹配`。\n"
+            "工作区已有 `notes.txt`（5 行英文）。写完用 run_command 分别以 fix、docs、todo "
+            "三个关键字各运行一次，确认行号与命中行数都正确。"
+        ),
+        files={"notes.txt": (
+            "release notes 2026-08\n"
+            "fix: login timeout on slow network\n"
+            "feat: add export button\n"
+            "fix: crash when file is missing\n"
+            "docs: update readme\n"
+        )},
+        # 三组参数是防硬编码的关键：只喂一组的话，"把答案直接 print 出来"就能通过。
+        verify=_check_cli("find_kw.py", [
+            (["notes.txt", "fix"], [("应命中第 2、4 行", lambda out: _line_numbers(out) == {2, 4})]),
+            (["notes.txt", "docs"], [("应命中第 5 行", lambda out: _line_numbers(out) == {5})]),
+            (["notes.txt", "todo"], [("无匹配时应明确说明", lambda out: "无匹配" in out)]),
+        ]),
+    ),
+    EvalTask(
+        name="wordfreq",
+        intent="词频统计（归一 + 排序）",
+        prompt=(
+            "新建 `wordfreq.py`：读取同目录的 `article.txt`，统计其中出现次数最多的"
+            "**前 3 个单词**及其次数并打印。\n"
+            "规则：比较时忽略大小写，并忽略紧挨着单词的标点符号——"
+            "因此 `Apple,` 与 `apple` 算同一个词。\n"
+            "输出按次数从高到低，每行一个，写成 `单词 次数`（例如 `apple 4`），只输出前 3 个。\n"
+            "写完用 run_command 运行确认。"
+        ),
+        files={"article.txt": (
+            "apple banana apple cherry\n"
+            "Apple, banana cherry\n"
+            "apple banana\n"
+            "date\n"
+        )},
+        # 归一化后：apple 4 / banana 3 / cherry 2 / date 1（前 3 名不含 date）
+        verify=_check_stdout("wordfreq.py", [
+            ("apple 应出现 4 次", _pair_line("apple", 4)),
+            ("banana 应出现 3 次", _pair_line("banana", 3)),
+            ("cherry 应出现 2 次", _pair_line("cherry", 2)),
+            ("只取前 3 个，不该输出 date", lambda out: not _pair_line("date", 1)(out)),
+        ]),
+    ),
+    EvalTask(
+        name="flatten",
+        intent="递归展平任意深度嵌套",
+        prompt=(
+            "新建 `flatten.py`，实现 `flatten(items)`：把**任意深度**嵌套的列表展平成一维列表，"
+            "保持元素原有顺序，返回一个新列表，不得修改传入的原列表。\n"
+            "空列表、或列表里全是空列表，都应返回 `[]`。\n"
+            "写完用 run_command 运行验证：flatten([1, [2, [3, 4], 5], [], 6]) 应得到 [1, 2, 3, 4, 5, 6]。"
+        ),
+        # 关键是"任意深度"：只展平一层的实现会在深嵌套用例上露馅。
+        verify=_check_import("flatten", """
+assert flatten.flatten([1, [2, [3, 4], 5], [], 6]) == [1, 2, 3, 4, 5, 6], '嵌套展平错'
+assert flatten.flatten([]) == [], '空列表错'
+assert flatten.flatten([1, 2, 3]) == [1, 2, 3], '本就平坦的列表应原样返回'
+assert flatten.flatten([[[[[1]]]]]) == [1], '深嵌套错'
+assert flatten.flatten([[], [[]]]) == [], '元素全是空列表应得 []'
+src = [1, [2]]
+flatten.flatten(src)
+assert src == [1, [2]], '不该修改入参'
+"""),
+    ),
+    EvalTask(
+        name="bank",
+        intent="跨模块 + 转账原子性",
+        prompt=(
+            "新建两个文件 `account.py` 与 `bank.py`：\n"
+            "- `account.py` 定义 `Account` 类：`Account(name, balance=0)`，属性 `.name` / `.balance`，"
+            "方法 `deposit(amount)`、`withdraw(amount)`（**余额不足时抛 ValueError，且余额保持不变**）。\n"
+            "- `bank.py` 用 `from account import Account` 复用它，定义 `Bank` 类："
+            "`open(name, balance=0)` 开账户并返回该账户；`get(name)` 取账户；"
+            "`transfer(源名字, 目标名字, amount)` 转账（源账户余额不足时抛 ValueError）；"
+            "`total()` 返回所有账户余额之和。\n"
+            "关键约束：转账要么完整发生、要么完全不发生——失败的那次转账不能留下改过的余额。\n"
+            "写完用 run_command 运行验证（含失败转账后余额未变的检查）。"
+        ),
+        # 这一题真正测的是"失败操作的原子性"：多数实现只顾成功路径，
+        # 失败时会先把源账户扣成负数再抛异常。total() 是抓它的抓手。
+        verify=_check_import("bank", """
+from account import Account
+from bank import Bank
+a = Account('a', 100)
+a.deposit(50)
+assert a.balance == 150, 'deposit 错'
+a.withdraw(30)
+assert a.balance == 120, 'withdraw 错'
+try:
+    a.withdraw(999)
+    raise AssertionError('余额不足的取款应抛 ValueError')
+except ValueError:
+    pass
+assert a.balance == 120, '失败的取款不该改变余额'
+
+b = Bank()
+b.open('x', 100)
+b.open('y', 0)
+b.transfer('x', 'y', 40)
+assert b.get('x').balance == 60, '转出方余额错'
+assert b.get('y').balance == 40, '转入方余额错'
+assert b.total() == 100, '转账不该改变总余额'
+try:
+    b.transfer('y', 'x', 999)
+    raise AssertionError('余额不足的转账应抛 ValueError')
+except ValueError:
+    pass
+assert b.total() == 100, '失败的转账不该留下改动（缺原子性）'
+assert b.get('y').balance == 40, '失败的转账不该扣钱'
+"""),
+    ),
+    EvalTask(
+        name="parselog",
+        intent="日志过滤：按级别抽取并保序",
+        prompt=(
+            "工作区已有 `server.log`（6 行日志，格式为 `日期 时间 级别 消息`，级别为 "
+            "INFO / WARN / ERROR 之一）。\n"
+            "新建 `parselog.py`：读取该文件，挑出所有级别为 ERROR 的行。运行后打印——\n"
+            "第一行固定为 `ERROR 条数: N`；随后按**在文件中出现的顺序**每行一条，"
+            "格式为 `HH:MM:SS 消息内容`（不要带日期部分）。\n"
+            "不要把 WARN / INFO 行算进来。写完用 run_command 运行确认。"
+        ),
+        files={"server.log": (
+            "2026-08-30 10:00:01 INFO  started\n"
+            "2026-08-30 10:00:05 ERROR db timeout\n"
+            "2026-08-30 10:00:09 WARN  slow query\n"
+            "2026-08-30 10:00:12 ERROR auth failed\n"
+            "2026-08-30 10:00:20 INFO  retrying\n"
+            "2026-08-30 10:00:31 ERROR cache miss\n"
+        )},
+        verify=_check_stdout("parselog.py", [
+            ("第一行应报 ERROR 共 3 条",
+             lambda out: bool(re.search(r"(?<!\d)3(?!\d)", _first_nonempty_line(out)))),
+            ("应含 10:00:05 db timeout", lambda out: _has_line(out, "10:00:05", "db timeout")),
+            ("应含 10:00:12 auth failed", lambda out: _has_line(out, "10:00:12", "auth failed")),
+            ("应含 10:00:31 cache miss", lambda out: _has_line(out, "10:00:31", "cache miss")),
+            ("不该把 WARN 行算进来", lambda out: "slow query" not in (out or "")),
+        ]),
     ),
 ]
 
@@ -393,6 +622,32 @@ def _with_max_steps(cfg, max_steps: int):
 # ----------------------------------------------------------------------------
 # 报告
 # ----------------------------------------------------------------------------
+def _disp_width(s: str) -> int:
+    """字符串的终端显示宽度（CJK 与全角标点占 2 列）。
+
+    报告是要贴进答辩材料的，`{s:<26}` 按**字符数**补齐，而 CJK 在终端里占两列，
+    于是含中文的那一列会集体错位——表格糊了，数字就没法读。
+    按 East Asian Width 规则算宽度再手工补空格，才能对齐。
+    """
+    w = 0
+    for ch in s:
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def _pad(s: str, width: int, align: str = "<") -> str:
+    """按显示宽度补齐（超宽时截断，截断也按显示宽度算）。"""
+    out, w = "", 0
+    for ch in s:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > width:
+            break
+        out += ch
+        w += cw
+    gap = " " * max(0, width - w)
+    return (out + gap) if align == "<" else (gap + out)
+
+
 def render_report(outcomes: List[EvalOutcome], *, model: str = "", elapsed: float = 0.0) -> str:
     n = len(outcomes)
     passed = sum(1 for o in outcomes if o.verify_ok)
@@ -417,15 +672,19 @@ def render_report(outcomes: List[EvalOutcome], *, model: str = "", elapsed: floa
     L.append("  自述失败但验证通过 = 悲观失败（能力被低估，通常是模型不敢收尾）。")
     L.append("")
 
-    L.append("  " + "-" * 74)
-    L.append(f"  {'任务':<10}{'考察点':<26}{'结局':<14}{'步':>3}{'调用':>5}{'耗时':>8}{'产物':>6}")
-    L.append("  " + "-" * 74)
+    L.append("  " + "-" * 76)
+    L.append("  " + _pad("任务", 10) + _pad("考察点", 30) + _pad("结局", 14)
+             + _pad("步", 3, ">") + _pad("调用", 5, ">") + _pad("耗时", 8, ">")
+             + _pad("产物", 6, ">"))
+    L.append("  " + "-" * 76)
     for o in outcomes:
         L.append(
-            f"  {o.task:<10}{o.intent[:24]:<26}{o.finish_reason:<14}"
-            f"{o.steps:>3}{o.tool_calls:>5}{o.elapsed:>7.1f}s{'✓' if o.verify_ok else '✗':>6}"
+            "  " + _pad(o.task, 10) + _pad(o.intent, 30) + _pad(o.finish_reason, 14)
+            + _pad(str(o.steps), 3, ">") + _pad(str(o.tool_calls), 5, ">")
+            + _pad(f"{o.elapsed:.1f}s", 8, ">")
+            + _pad("✓" if o.verify_ok else "✗", 6, ">")
         )
-    L.append("  " + "-" * 74)
+    L.append("  " + "-" * 76)
 
     if n:
         L.append("")
