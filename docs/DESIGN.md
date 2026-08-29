@@ -44,6 +44,104 @@ agent/loop.py          主循环（编排者）：调模型→解析→执行工
 3. 配额触发（步数 / 上下文 / 连续失败 / 重复调用）；
 4. 用户 Ctrl-C 中断（保留历史）。
 
+### 2.1 架构总览
+
+<svg viewBox="0 0 680 380" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <rect width="680" height="380" fill="#F5F7FA"/>
+  <text x="20" y="26" font-size="15" font-weight="700" fill="#1A1A1A">架构总览：主循环是中枢，其余皆为可替换 / 可单测的模块</text>
+  <rect x="250" y="40" width="180" height="40" rx="6" fill="#FFFFFF" stroke="#2F6FED" stroke-width="1.5"/>
+  <text x="340" y="65" font-size="13" text-anchor="middle" fill="#1A1A1A">run.py / cli.py（入口 + REPL）</text>
+  <rect x="250" y="168" width="180" height="56" rx="8" fill="#2F6FED" stroke="#1E4FAE" stroke-width="1.5"/>
+  <text x="340" y="192" font-size="14" font-weight="700" text-anchor="middle" fill="#FFFFFF">AgentLoop</text>
+  <text x="340" y="210" font-size="11" text-anchor="middle" fill="#EAF1FF">主循环 · 编排者</text>
+  <g font-size="11" fill="#1A1A1A" text-anchor="middle">
+    <rect x="20" y="100" width="172" height="40" rx="6" fill="#FFFFFF" stroke="#9AA5B1"/>
+    <text x="106" y="118">agent/llm.py</text><text x="106" y="133">LLM 接入层</text>
+    <rect x="20" y="232" width="172" height="40" rx="6" fill="#FFFFFF" stroke="#9AA5B1"/>
+    <text x="106" y="250">agent/history.py</text><text x="106" y="265">历史 · token · 压缩</text>
+    <rect x="488" y="100" width="172" height="40" rx="6" fill="#FFFFFF" stroke="#9AA5B1"/>
+    <text x="574" y="118">agent/parser.py</text><text x="574" y="133">输出解析</text>
+    <rect x="488" y="232" width="172" height="40" rx="6" fill="#FFFFFF" stroke="#9AA5B1"/>
+    <text x="574" y="250">agent/tools/</text><text x="574" y="265">工具系统</text>
+    <rect x="254" y="300" width="172" height="40" rx="6" fill="#FFFFFF" stroke="#9AA5B1"/>
+    <text x="340" y="318">agent/profile.py</text><text x="340" y="333">项目画像</text>
+    <rect x="20" y="168" width="172" height="40" rx="6" fill="#FFFFFF" stroke="#9AA5B1"/>
+    <text x="106" y="186">agent/security.py</text><text x="106" y="201">安全层</text>
+    <rect x="488" y="168" width="172" height="40" rx="6" fill="#FFFFFF" stroke="#9AA5B1"/>
+    <text x="574" y="186">agent/selfrepair.py</text><text x="574" y="201">自修复感知</text>
+  </g>
+  <g stroke="#6B7280" stroke-width="1.2" fill="none">
+    <line x1="340" y1="80" x2="340" y2="168"/>
+    <line x1="192" y1="120" x2="250" y2="178"/>
+    <line x1="192" y1="252" x2="250" y2="212"/>
+    <line x1="488" y1="120" x2="430" y2="178"/>
+    <line x1="488" y1="252" x2="430" y2="212"/>
+    <line x1="340" y1="224" x2="340" y2="300"/>
+    <line x1="192" y1="188" x2="250" y2="188"/>
+    <line x1="488" y1="188" x2="430" y2="188"/>
+  </g>
+</svg>
+
+### 2.2 主循环时序（一轮的核心流转）
+
+<svg viewBox="0 0 680 440" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <rect width="680" height="440" fill="#F5F7FA"/>
+  <text x="20" y="26" font-size="15" font-weight="700" fill="#1A1A1A">主循环时序：一轮的核心流转与四类终止</text>
+  <g font-size="12" fill="#1A1A1A" text-anchor="middle">
+    <rect x="220" y="44" width="240" height="44" rx="8" fill="#FFFFFF" stroke="#2F6FED" stroke-width="1.5"/>
+    <text x="340" y="71">预算检查 / 上下文压缩</text>
+    <rect x="220" y="118" width="240" height="44" rx="8" fill="#FFFFFF" stroke="#2F6FED" stroke-width="1.5"/>
+    <text x="340" y="145">调模型 backend.chat（重试 / 流式）</text>
+    <rect x="220" y="192" width="240" height="44" rx="8" fill="#FFFFFF" stroke="#2F6FED" stroke-width="1.5"/>
+    <text x="340" y="219">解析 parser.parse（双通道）</text>
+    <rect x="220" y="384" width="240" height="44" rx="8" fill="#FFFFFF" stroke="#2F6FED" stroke-width="1.5"/>
+    <text x="340" y="405">执行工具 registry.execute</text>
+    <text x="340" y="424" font-size="10" fill="#6B7280">（只读并行 · 写 / 命令顺序）</text>
+    <rect x="520" y="278" width="140" height="50" rx="8" fill="#FCE8E6" stroke="#C0392B" stroke-width="1.5"/>
+    <text x="590" y="298">收尾 / 结束</text>
+    <text x="590" y="316" font-size="10" fill="#C0392B">finish·无调用·配额·Ctrl-C</text>
+  </g>
+  <polygon points="340,256 460,300 340,344 220,300" fill="#FFFFFF" stroke="#9AA5B1" stroke-width="1.5"/>
+  <text x="340" y="305" font-size="12" text-anchor="middle" fill="#1A1A1A">有工具</text>
+  <text x="340" y="322" font-size="12" text-anchor="middle" fill="#1A1A1A">调用?</text>
+  <g stroke="#6B7280" stroke-width="1.2" fill="none">
+    <line x1="340" y1="88" x2="340" y2="118"/>
+    <line x1="340" y1="162" x2="340" y2="192"/>
+    <line x1="340" y1="236" x2="340" y2="256"/>
+    <line x1="340" y1="344" x2="340" y2="384"/>
+    <line x1="460" y1="300" x2="520" y2="300"/>
+    <line x1="220" y1="406" x2="200" y2="406" stroke-dasharray="4 3"/>
+    <line x1="200" y1="406" x2="200" y2="66" stroke-dasharray="4 3"/>
+    <line x1="200" y1="66" x2="220" y2="66"/>
+  </g>
+  <text x="472" y="292" font-size="10" fill="#6B7280">否</text>
+  <text x="150" y="240" font-size="10" fill="#6B7280" text-anchor="middle">是 → 下一轮</text>
+</svg>
+
+### 2.3 上下文治理（三层逐级降档）
+
+<svg viewBox="0 0 680 280" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <rect width="680" height="280" fill="#F5F7FA"/>
+  <text x="20" y="26" font-size="15" font-weight="700" fill="#1A1A1A">上下文治理：三层逐级降档，超预算才往下走</text>
+  <g font-size="12" fill="#1A1A1A">
+    <rect x="40" y="56" width="540" height="46" rx="8" fill="#FFFFFF" stroke="#2F6FED" stroke-width="1.5"/>
+    <text x="60" y="78">① 估算 token（tiktoken 精确）—— 发请求前判断预算，早压缩优于超窗</text>
+    <text x="60" y="95" font-size="10" fill="#6B7280">count_messages_tokens 遍历消息体；真实消耗另取 API usage</text>
+    <rect x="40" y="126" width="540" height="46" rx="8" fill="#FFFFFF" stroke="#2F6FED" stroke-width="1.5"/>
+    <text x="60" y="148">② 回执压缩（信号行优先）—— 工具输出写回前截断，保留 traceback / 错误</text>
+    <text x="60" y="165" font-size="10" fill="#6B7280">smart_compress：信号行 &gt; 头 &gt; 尾，预算不够也不丢关键错误</text>
+    <rect x="40" y="196" width="540" height="46" rx="8" fill="#FFFFFF" stroke="#2F6FED" stroke-width="1.5"/>
+    <text x="60" y="218">③ 历史摘要压缩 —— 超阈值时中段交模型摘要；摘要失败硬截断兜底</text>
+    <text x="60" y="235" font-size="10" fill="#6B7280">system 始终 index 0 不动；宁可丢信息也不让请求超窗报错</text>
+  </g>
+  <g stroke="#6B7280" stroke-width="1.2" fill="none">
+    <line x1="300" y1="102" x2="300" y2="126"/>
+    <line x1="300" y1="172" x2="300" y2="196"/>
+  </g>
+  <text x="312" y="118" font-size="10" fill="#6B7280">超预算</text>
+  <text x="312" y="188" font-size="10" fill="#6B7280">仍超</text>
+</svg>
+
 ---
 
 ## 3. 关键设计决策
@@ -198,3 +296,34 @@ agent/loop.py          主循环（编排者）：调模型→解析→执行工
   共同点是"写了名字和注释，没写行为"，靠**读注释之外的代码**才能发现。
 - **"流式输出会影响成本统计吗？"** 会，如果不处理的话。默认流式响应不带 usage，
   `/stats` 的 token 会静默变 0；所以显式要 `stream_options={"include_usage": True}`（见 3.7）。
+
+---
+
+## 6. Prompt 工程要点（核心差异点）
+
+本项目硬约束是「仅调用现有 LLM API + Prompt 工程，不做训练 / 微调」，因此 system prompt
+就是产品本身——它直接决定模型会不会用对工具、会不会乱来、能不能自纠偏。设计上遵循四条原则：
+
+1. **短而硬**：只写模型猜不到的信息（工具协议、边界、终止条件、项目画像）。
+   「你是一个乐于助人的 AI」之类无信息量的话不写，既占 token 也无行为约束。
+2. **可执行**：每条都是祈使句、带明确触发条件（"先读现状再改""改前必须 read_file"），
+   而不是价值观宣导。
+3. **协议与工具清单分离**：工具清单由 registry 动态生成（`describe()`），
+   避免"提示词写了工具、代码没注册"的不一致；新增工具不改 prompt 也自动出现。
+4. **双通道一致**：原生 function calling 与文本协议共用同一段正文，
+   只替换"如何输出调用"那一节——同一份心智模型，两种落地方式。
+
+本轮在原有基础上强化了三处（均有回归测试守护，见 `tests/test_smoke.py` 的
+`test_system_prompt_mentions_clarify_parallel_and_decision_order`）：
+
+- **任务含糊先澄清**：需求有歧义或缺关键约束（语言 / 框架 / 输入输出格式）时，
+  先 `ask_user` 确认，不替用户拍板；但能用合理默认推进的，不无意义打断。
+- **可并行的事一轮发完**：互相独立的多个只读操作（list_dir / read_file /
+  grep_search / find_files）在同一轮一起发起，缩短等待（见 V5 并行执行）。
+- **决策顺序**：拿不准时按"先读现状 → 最小改动 → 小步验证 → 卡住就求助
+  （ask_user / rollback）"走，把"凭感觉宣布完成"提前堵死。
+
+反模式（我们刻意避开）：
+- 把系统提示词写成角色扮演剧本；
+- 在提示词里硬编码工具名但代码未注册（一致性靠 registry 动态注入保证）；
+- 一条规则同时承担两种含义（本项目反复踩坑，如 `None` 既是"文件不存在"又是"没采集"）。
