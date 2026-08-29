@@ -453,6 +453,20 @@ class AgentLoop:
             # --- 3) 无调用 → 视为收尾 ---
             if not outcome.calls:
                 text = (outcome.narration or msg.content or "").strip()
+                if not text and not outcome.issues:
+                    # 纠错重试都试过了，模型依然一个字都没给：没有正文、没有工具调用、
+                    # 也没有任何可指出的解析问题。它既不是"完成"（什么都没说），
+                    # 也不是"解析失败"（没有可反馈的错误），必须单列一种结局。
+                    # 判成 model_final 会让一次网关抖动被记成成功收尾，
+                    # 而此时产物可能根本没生成——这正是以产物为准的评测该抓出来的事。
+                    result.finish_reason = "empty_response"
+                    result.answer = (
+                        "模型连续给出空响应（无正文、无工具调用），已停止。"
+                        "通常是网关抖动或模型未接上话，可直接重试本任务。"
+                    )
+                    if self.console:
+                        self.console.warn(result.answer)
+                    return
                 if outcome.is_final or not outcome.issues:
                     result.finish_reason = "model_final"
                 else:

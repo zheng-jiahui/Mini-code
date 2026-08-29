@@ -46,6 +46,7 @@ REASON_LABELS = {
     "no_progress": "原地打转",
     "too_many_errors": "连续失败过多",
     "parse_failed": "输出无法解析",
+    "empty_response": "模型空响应（未计入成功）",
     "llm_error": "模型调用报错",
     "internal_error": "内部错误",
     "aborted": "被中断",

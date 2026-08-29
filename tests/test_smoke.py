@@ -1972,6 +1972,183 @@ def test_metrics_survive_checkpoint_roundtrip():
 
 
 # ----------------------------------------------------------------------------
+# V10：评测台（以产物为准，不采信模型自述）
+# ----------------------------------------------------------------------------
+# 参考解：每个任务一份"正确实现"与一份"看起来像但其实是错的实现"。
+# 验证器必须能区分两者——一个恒为真的验证器会让整场评测失去意义，
+# 而且不会报错、只会安静地给出 100% 通过率，这比没有验证器更危险。
+_CORRECT_SOLUTIONS = {
+    "calc": {"calc.py":
+             "def add(a, b):\n    return a + b\n"
+             "def sub(a, b):\n    return a - b\n"
+             "def mul(a, b):\n    return a * b\n"
+             "def div(a, b):\n    if b == 0:\n        raise ValueError('div by zero')\n    return a / b\n"},
+    "fixbug": {"stats.py":
+               "def total(items):\n    return sum(items)\n\n\n"
+               "def average(items):\n    if not items:\n        return 0\n    return total(items) / len(items)\n"},
+    "csvreport": {"report.py":
+                  "import csv\nrows = list(csv.DictReader(open('scores.csv', encoding='utf-8')))\n"
+                  "n = [int(r['分数']) for r in rows]\n"
+                  "print('平均分:', round(sum(n) / len(n), 1))\nprint('最高分:', max(n))\n"},
+    "dedup": {"dedup.py":
+              "def dedup(items):\n    seen = set()\n    out = []\n    for x in items:\n"
+              "        if x not in seen:\n            seen.add(x)\n            out.append(x)\n    return out\n"},
+    "lru": {"lru.py":
+            "from collections import OrderedDict\n"
+            "class LRUCache:\n    def __init__(self, capacity):\n"
+            "        self.cap = capacity\n        self.d = OrderedDict()\n"
+            "    def get(self, k):\n        if k not in self.d:\n            return -1\n"
+            "        self.d.move_to_end(k)\n        return self.d[k]\n"
+            "    def put(self, k, v):\n        if k in self.d:\n            self.d.move_to_end(k)\n"
+            "        self.d[k] = v\n        if len(self.d) > self.cap:\n"
+            "            self.d.popitem(last=False)\n"},
+}
+
+_BROKEN_SOLUTIONS = {
+    "calc": {"calc.py": "def add(a, b):\n    return a - b\n"          # add 写错
+                        "def sub(a, b):\n    return a - b\n"
+                        "def mul(a, b):\n    return a * b\n"
+                        "def div(a, b):\n    return a / b\n"},         # 除 0 不抛异常
+    "fixbug": {"stats.py": "def total(items):\n    return sum(items)\n\n\n"
+                           "def average(items):\n    if not items:\n        return 0\n"
+                           "    return total(items) / (len(items) - 1)\n"},   # 原 bug 未修
+    "csvreport": {"report.py": "print('平均分:', 1)\nprint('最高分:', 2)\n"},  # 数字是编的
+    "dedup": {"dedup.py": "def dedup(items):\n    return list(set(items))\n"},  # 丢顺序
+    "lru": {"lru.py": "class LRUCache:\n    def __init__(self, capacity):\n"
+                      "        self.cap = capacity\n        self.d = {}\n"
+                      "    def get(self, k):\n        return self.d.get(k, -1)\n"
+                      "    def put(self, k, v):\n        self.d[k] = v\n"},     # 不淘汰
+}
+
+
+def _verify_with(task_name, solutions):
+    """把参考解放进临时目录，跑该任务的验证器。"""
+    from agent.eval import TASKS
+    task = next(t for t in TASKS if t.name == task_name)
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        for rel, content in task.files.items():
+            (d / rel).write_text(content, encoding="utf-8")
+        for rel, content in solutions.items():
+            (d / rel).write_text(content, encoding="utf-8")
+        return task.verify(d)
+
+
+def test_eval_verifiers_accept_correct_solutions():
+    """验证器必须放行正确实现。否则整套评测会把好结果判成失败。"""
+    for name in _CORRECT_SOLUTIONS:
+        ok, msg = _verify_with(name, _CORRECT_SOLUTIONS[name])
+        assert ok, f"{name} 的正确实现被误判：{msg}"
+
+
+def test_eval_verifiers_reject_broken_solutions():
+    """验证器必须拦下"看起来像但其实错"的实现。
+
+    这是评测台最关键的一条：一个恒为真的验证器不会报错，只会安静地给出
+    100% 通过率——比没有验证器更危险。所以每条任务的错误解都必须被抓住。
+    """
+    for name in _BROKEN_SOLUTIONS:
+        ok, msg = _verify_with(name, _BROKEN_SOLUTIONS[name])
+        assert not ok, f"{name} 的错误实现被误放行，验证器区分度不足"
+
+
+def test_eval_report_separates_self_claim_from_artifact():
+    """报告必须区分"模型自述完成"与"产物验证通过"，并点出两类偏差。"""
+    from agent.eval import EvalOutcome, render_report
+    outcomes = [
+        EvalOutcome("calc", "新建", "finish", 3, 3, 0, 5.0, 900, True, "通过"),
+        # 自述完成但产物跑不通 —— 假完成，最危险的一类
+        EvalOutcome("dedup", "算法", "finish", 4, 5, 0, 7.0, 1200, False, "顺序错"),
+        # 产物其实通过了却没敢收尾 —— 悲观失败，能力被低估
+        EvalOutcome("lru", "数据结构", "max_steps", 8, 9, 1, 20.0, 3000, True, "通过"),
+    ]
+    report = render_report(outcomes, model="test-model", elapsed=32.0)
+    assert "产物验证通过：2/3" in report
+    assert "模型自述完成：2/3" in report
+    assert "假完成" in report and "dedup" in report
+    assert "悲观失败" in report and "lru" in report
+    # 退出码语义：以产物为准，不是以自述为准
+    from agent.eval import main
+    assert main is not None
+
+
+def test_empty_model_response_is_not_counted_as_success():
+    """模型一个字都没说 ≠ 任务完成（评测台实跑才暴露的缺陷）。
+
+    原行为：空响应在文本通道被判成 is_final → 主循环跳过 _EMPTY_OUTPUT_HINT 纠错
+    → 直接以 model_final 收尾，answer 为"模型未给出总结"。于是网关抖一下，
+    任务就被记成"成功收尾"，而产物可能根本没生成。
+
+    两条修正：① 文本通道里"没有调用块"的默认仅在**确有正文**时成立；
+    ② 纠错重试耗尽后仍为空，单列 empty_response 结局，且不计入成功率。
+    这条是"假完成拦截"的另一半：拦的是"改了文件没验证"，这里拦的是"沉默被当结论"。
+    """
+    from agent.llm import AssistantMessage
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        backend, profile = _scripted(
+            [{"content": "写", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "a.py", "content": "x = 1\n"}}]}],
+            native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        orig_chat, n = backend.chat, {"c": 0}
+
+        def chat(*a, **k):
+            n["c"] += 1
+            if n["c"] >= 2:                       # 之后一律返回完全空的响应
+                return AssistantMessage(content="", tool_calls=[], usage=None)
+            return orig_chat(*a, **k)
+        backend.chat = chat
+
+        result = loop.run("写个文件")
+        assert result.finish_reason == "empty_response", result.finish_reason
+        assert n["c"] == 4, f"应先纠错重试 2 次再放弃，实际调用 {n['c']} 次"
+        rec = loop.metrics.tasks[-1]
+        assert rec.succeeded is False, "空响应绝不能计入成功率"
+        assert "空响应" in loop.metrics.render_panel()
+
+
+def test_empty_response_is_retried_with_hint_before_giving_up():
+    """空响应第一次出现时要给纠错提示重试，而不是立刻放弃。
+
+    但重试要**有限**：模型若持续空响应，无限重试只会烧 token。
+    """
+    from agent.llm import AssistantMessage
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        backend, profile = _scripted([], native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        n = {"c": 0}
+
+        def chat(*a, **k):
+            n["c"] += 1
+            if n["c"] == 1:
+                return AssistantMessage(content="", tool_calls=[], usage=None)
+            return AssistantMessage(content="FINAL: 好了。", tool_calls=[], usage=None)
+        backend.chat = chat
+
+        result = loop.run("什么都不做")
+        assert result.finish_reason == "model_final", result.finish_reason
+        assert n["c"] == 2, "第一次空响应后应重试一次"
+        joined = "\n".join(str(m.get("content", "")) for m in loop.history.messages)
+        assert "没有包含任何工具调用" in joined, "应把 _EMPTY_OUTPUT_HINT 回灌给模型"
+
+
+def test_eval_task_suite_is_stdlib_only_and_deterministic():
+    """任务套件的基本卫生：有验证器、有考察点、预置文件齐全。
+
+    这些是"评测结果可信"的前提条件，缺一样报告就只是好看而已。
+    """
+    from agent.eval import TASKS
+    names = [t.name for t in TASKS]
+    assert len(names) == len(set(names)), "任务名不能重复（会被 --task 过滤搞混）"
+    for t in TASKS:
+        assert t.verify is not None, f"{t.name} 缺验证器"
+        assert t.intent, f"{t.name} 缺考察点说明"
+        assert t.prompt.strip(), f"{t.name} 缺任务描述"
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

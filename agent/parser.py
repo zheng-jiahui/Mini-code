@@ -290,13 +290,20 @@ class ToolCallParser:
     # ---------------- 通道 B ----------------
     def _parse_text(self, msg: AssistantMessage) -> ParseOutcome:
         text = msg.content or ""
+        content = text.strip()
         narration, raw_calls, issues = extract_text_calls(text)
         outcome = ParseOutcome(narration=narration.strip(), source="text", issues=issues)
         for idx, raw in enumerate(raw_calls):
             self._build_call(outcome, raw["name"], raw["arguments"], f"text_{idx}_{raw['name']}", "text")
         # 文本通道下，"没有调用块"通常意味着模型认为任务已完成
         self._post_process(outcome, msg)
-        if not outcome.calls and not outcome.issues:
+        # 但**空响应不属于这个默认**：模型一个字都没说，不等于"它认为完成了"。
+        # 空响应更可能是网关抖动、流式被截断、或模型没接上话；
+        # 把它判成 final，主循环就不会走 _EMPTY_OUTPUT_HINT 纠错，
+        # 任务会带着一句"未给出总结"被记成成功收尾（model_final）。
+        # 本项目的"假完成拦截"守的是"改了文件没验证"，这里守的是另一半：
+        # **沉默不是结论**。
+        if not outcome.calls and not outcome.issues and content:
             outcome.is_final = True
         return outcome
 
