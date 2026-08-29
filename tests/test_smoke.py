@@ -724,6 +724,60 @@ def test_stats_panel_counts_output_compressions():
 
 
 # ----------------------------------------------------------------------------
+# V6：交付打磨（每个工具至少一条测试 + 覆盖率补强）
+# ----------------------------------------------------------------------------
+def test_read_file_returns_numbered_lines():
+    """read_file 带行号返回，是后续 edit_block 定位的可靠锚点。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        (Path(tmp) / "a.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        r = registry.execute("read_file", {"path": "a.py"}, ctx)
+        assert r.ok, r.render()
+        assert "1| def f()" in r.render()
+        assert "2|     return 1" in r.render()
+
+
+def test_grep_search_finds_pattern():
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        (Path(tmp) / "a.py").write_text("def foo():\n    pass\ndef bar():\n    pass\n", encoding="utf-8")
+        r = registry.execute("grep_search", {"pattern": "def (foo|bar)"}, ctx)
+        assert r.ok
+        assert "a.py:1:" in r.render() and "a.py:3:" in r.render()
+
+
+def test_find_files_by_glob():
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        (Path(tmp) / "a.py").write_text("x", encoding="utf-8")
+        (Path(tmp) / "b.txt").write_text("x", encoding="utf-8")
+        r = registry.execute("find_files", {"pattern": "*.py"}, ctx)
+        assert r.ok
+        assert "a.py" in r.render()
+        assert "b.txt" not in r.render()
+
+
+def test_ask_user_non_interactive_returns_graceful():
+    """非交互环境（console=None，如测试）：应提示自行合理假设，而非抛错或卡住。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        r = registry.execute("ask_user", {"question": "用哪个框架？"}, ctx)
+        assert r.ok, r.render()
+        assert "非交互" in r.render()
+
+
+def test_list_dir_shows_tree():
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        (Path(tmp) / "sub").mkdir()
+        (Path(tmp) / "sub" / "x.py").write_text("x", encoding="utf-8")
+        r = registry.execute("list_dir", {"path": "."}, ctx)
+        assert r.ok
+        assert "sub/" in r.render()
+        assert "x.py" in r.render()
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
