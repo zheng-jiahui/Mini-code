@@ -25,6 +25,13 @@ python run.py --resume -t "接着上次继续"         # 从上次检查点恢�
 python run.py --list-tools                     # 查看全部工具
 ```
 
+**跑一次能力评测**（真实端点，约 40 秒）：
+
+```bash
+python -m agent.eval                           # 5 个标准任务，以产物验证为准
+python -m agent.eval --task calc,dedup --json  # 只跑指定任务 / 落盘 JSON
+```
+
 **切换模型档位**（档位在 `config.yaml` 的 `profiles` 下配置，可同时配多个端点）：
 
 ```bash
@@ -58,6 +65,9 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 │   ├── cli.py                # 参数解析与 REPL 命令
 │   ├── profile.py            # 项目画像（语言/框架/测试命令）+ 工作区状态扫描
 │   ├── selfrepair.py         # 自修复感知层：测试命令识别、traceback 定位（纯函数）
+│   ├── metrics.py            # 质量指标：结局分布 / 自修复回合 / 返工
+│   ├── checkpoint.py         # 会话检查点：跨进程续跑
+│   ├── eval.py               # 评测台：5 个标准任务，验证产物
 │   └── tools/
 │       ├── base.py           # ToolSpec / ToolRegistry / ToolResult（自建工具系统）
 │       ├── filesystem.py     # read_file / write_file / edit_block / list_dir
@@ -86,6 +96,8 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 | 循环控制 | 步数上限、token 预算、连续错误上限、重复调用指纹去重、假完成拦截、用户 Ctrl-C 中断 |
 | 安全 | 工作区路径沙箱、危险命令拦截/二次确认、命令超时（带上限夹取）、写前自动备份 |
 | 可观测 | 每步打印「思考 / 工具调用 / 结果 / 耗时」，流式输出，`/diff` 审阅改动、`/stats` 成本与瓶颈面板，会话可存 JSONL 复盘 |
+| 质量指标 | `/stats` 也回答"做对了没有"：结局分布、失败率、自修复回合数、返工 |
+| 评测台 | `python -m agent.eval`：5 个标准任务，**以产物能否跑通为准**（不采信模型自述），并标出假完成 / 悲观失败 |
 
 ---
 
