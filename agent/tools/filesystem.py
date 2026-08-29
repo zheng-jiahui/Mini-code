@@ -241,12 +241,27 @@ def _looks_binary(raw: bytes) -> bool:
         return True
 
 
+def _backup_root(ctx: ToolContext) -> Path:
+    """备份根目录：与 workplace 同级（项目根/.agent_backups）。
+
+    config.workspace_root 是"生成代码的家"（…/workplace），它的父目录即项目根。
+    """
+    home = getattr(ctx.config, "workspace_root", None) or ctx.config.workspace
+    base = Path(str(home)).expanduser().resolve().parent
+    return base / (getattr(ctx.config, "backup_dir", None) or ".agent_backups")
+
+
 def _backup(ctx: ToolContext, target: Path) -> str:
-    """把即将被覆盖的文件备份到 .agent_backups/<时间戳>/<相对路径>。"""
+    """把即将被覆盖的文件备份到 .agent_backups/.overwrites/<任务名>/<时间戳>/。
+
+    放在 .overwrites 这个隐藏目录下，是为了不干扰顶层的任务快照
+    （.agent_backups/<任务名>_<时间戳>_<第N次>/），也避免影响"第几次"的计数。
+    """
     try:
         rel = Path(ctx.guard.relpath(target))
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        dest_dir = Path(ctx.config.workspace).expanduser().resolve() / getattr(ctx.config, "backup_dir", ".agent_backups") / stamp
+        task_name = Path(str(ctx.config.workspace)).expanduser().resolve().name
+        dest_dir = _backup_root(ctx) / ".overwrites" / task_name / stamp
         dest = dest_dir / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(target, dest)

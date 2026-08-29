@@ -14,10 +14,14 @@ https://github.com/______/minicode-coding-agent
    （api_keys.yaml 与 config.yaml 均已加入 .gitignore，不会入库）
 3) 常用命令：
    python run.py                                 交互式，直接输入任务
-   python run.py -p nscc -t "写一个快排并跑通测试"   单次任务
+   python run.py -n user_login -t "创建用户登录功能"  指定任务名（决定文件夹名）
+   python run.py -p nscc -t "写一个快排并跑通测试"   单次任务，任务名由描述自动生成
    python run.py --mock -t "演示"                 离线演示，不联网也能看完整流程
    python run.py --list-tools / --print-prompt    查看工具清单与系统提示词
-4) 测试：python tests/test_smoke.py（10 个用例，无需 API key）
+4) 产物目录（workplace 与 .agent_backups 同级，均不入库）：
+   workplace/任务名/                         该任务的最新代码
+   .agent_backups/任务名_20260129_143022_第1次/   每次生成的完整归档，序号自动递增
+5) 测试：python tests/test_smoke.py（12 个用例，无需 API key）
         python tests/test_fake_server.py（本地假服务端，验证 HTTP 协议链路）
 
 三、特色功能
@@ -36,9 +40,10 @@ https://github.com/______/minicode-coding-agent
 6. 安全与可回滚：工作区路径沙箱、危险命令黑名单（deny/confirm 两档）、命令超时并
    杀进程树、覆盖写前自动备份、输出密钥脱敏。
 7. 可观测可复盘：每步打印思考/调用/回执/耗时，会话自动落盘为 JSONL。
-8. 任务隔离：每个任务在 workspace 下自动建立独立子目录（时间戳+任务摘要），
-   该任务的代码、.agent_backups 备份、.agent_sessions 会话日志都归拢在同一目录内，
-   任务之间互不干扰；同会话追问沿用目录，/new 才开新目录。
+8. 产物组织与版本归档：每个任务在 workplace/ 下以"任务名"建文件夹，始终保存最新代码；
+   每次生成结束后，自动把该目录完整快照归档到与 workplace 同级的
+   .agent_backups/{任务名}_{时间戳}_{第N次}/，同名任务反复生成会依次累计"第1次""第2次"。
+   覆盖写的单文件另存于 .overwrites/ 下（供 /undo 回滚），不干扰顶层归档命名。
 
 四、其它说明
 - 项目结构、主循环流程图与伪代码、System Prompt 全文、工具输出格式规范、各模块

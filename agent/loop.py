@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -116,7 +117,8 @@ class RunResult:
     elapsed: float = 0.0
     compacted: int = 0
     error_message: str = ""
-    task_dir: str = ""            # 本次任务产物的存放目录（workspace 下的子文件夹）
+    task_dir: str = ""            # 任务目录：workplace/{任务名}/，始终是最新的
+    backup_dir: str = ""          # 本次快照：.agent_backups/{任务名}_{时间戳}_{第N次}/
 
     @property
     def succeeded(self) -> bool:
@@ -170,6 +172,7 @@ class AgentLoop:
         root = getattr(config, "workspace_root", None) or config.workspace
         self.workspace_root: Path = Path(str(root)).expanduser().resolve()
         self._task_dir: Optional[Path] = None
+        self._task_name: Optional[str] = None
 
         self._fingerprints: Deque[str] = deque(maxlen=6)
         self._stale_steps = 0
@@ -184,40 +187,88 @@ class AgentLoop:
         """当前任务的子目录（还没跑过任务时为 None）。"""
         return self._task_dir
 
-    def prepare_task_dir(self, task: str, force_new: bool = False) -> Path:
-        """为本次任务准备独立子目录，返回该目录路径。
+    @property
+    def task_name(self) -> Optional[str]:
+        """当前任务名（还没跑过任务时为 None）。"""
+        return self._task_name
 
-        首次调用（或 force_new=True）时在 workspace_root 下新建
-        `<时间戳>-<任务摘要>` 子目录，并把路径沙箱与系统提示词切到该目录。
-        同一会话内的后续追问会**沿用**当前目录，直到用 /new 开启新任务——
-        否则追问（如"再改成降序"）时模型将看不到上一轮刚生成的文件。
+    def prepare_task_dir(self, task: str, task_name: Optional[str] = None,
+                         force_new: bool = False) -> Path:
+        """为本次任务准备目录 workplace/{任务名}/，同名任务复用同一目录。
 
-        这样每个任务的代码、备份（.agent_backups）与会话日志（.agent_sessions）
-        都归拢在自己的文件夹里，任务之间互不干扰。
+        任务名优先级：显式传入的 task_name > 上次指定的名字 > 由任务描述自动提取。
+        workplace 下始终是该任务的**最新**代码；历史版本由 snapshot_to_backups()
+        归档到与 workplace 同级的 .agent_backups/ 里。
+
+        同一会话内的追问会沿用当前目录，直到 /new 开启新任务——否则追问
+        （如"再改成降序"）时模型会看不到上一轮刚生成的文件。
         """
         if not getattr(self.config, "per_task_dir", True):
-            # 关闭任务子目录：所有任务共用 workspace 根目录
+            # 关闭任务子目录：所有任务共用工作区根目录
             self._task_dir = self.workspace_root
+            self._task_name = self.workspace_root.name
             return self._task_dir
 
         if self._task_dir and not force_new:
             return self._task_dir
 
-        self._task_dir = self._make_task_dir(task)
+        raw = (task_name or self._task_name or "").strip()
+        name = _slugify(raw, max_chars=32) if raw else _slugify(task, max_chars=24)
+        if not name:
+            name = "未命名任务"
+
+        self._task_name = name
+        self._task_dir = self.workspace_root / name
+        self._task_dir.mkdir(parents=True, exist_ok=True)   # 已存在就复用，保留最新代码
         self._apply_task_dir()
         return self._task_dir
 
-    def _make_task_dir(self, task: str) -> Path:
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        slug = _slugify(task)
-        base = f"{stamp}-{slug}" if slug else stamp
-        candidate = self.workspace_root / base
-        n = 2
-        while candidate.exists():          # 同一秒撞名则加序号
-            candidate = self.workspace_root / f"{base}-{n}"
-            n += 1
-        candidate.mkdir(parents=True, exist_ok=True)
-        return candidate
+    # ------------------------------------------------------------------
+    # 历史备份
+    # ------------------------------------------------------------------
+    @property
+    def backup_root(self) -> Path:
+        """备份根目录：与 workplace 同级，例如 项目根/.agent_backups。"""
+        name = getattr(self.config, "backup_dir", None) or ".agent_backups"
+        return self.workspace_root.parent / name
+
+    def snapshot_to_backups(self) -> Optional[Path]:
+        """把当前任务目录的完整快照归档到 .agent_backups/{任务名}_{时间戳}_{第N次}/。
+
+        只在本次任务确实改动过文件时才备份；N 取该任务已有备份数 + 1，
+        因此同一任务反复生成会依次得到"第1次""第2次"……
+        """
+        if self._task_dir is None or not self._task_dir.exists():
+            return None
+        changes = self.ctx.session.get("changes", []) if self.ctx else []
+        if not changes:
+            return None                      # 本次没动过文件，无需备份
+
+        name = self._task_name or self._task_dir.name
+        root = self.backup_root
+        seq = self._next_backup_seq(root, name)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        dest = root / f"{name}_{stamp}_第{seq}次"
+        dest.mkdir(parents=True, exist_ok=True)
+
+        for item in self._task_dir.iterdir():
+            if item.name.startswith("."):    # 跳过 .agent_sessions 等内部目录
+                continue
+            target = dest / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
+        return dest
+
+    @staticmethod
+    def _next_backup_seq(backup_root: Path, task_name: str) -> int:
+        """该任务已有的备份数 + 1（目录名形如 任务名_时间戳_第N次）。"""
+        if not backup_root.exists():
+            return 1
+        prefix = f"{task_name}_"
+        return sum(1 for p in backup_root.iterdir()
+                   if p.is_dir() and p.name.startswith(prefix)) + 1
 
     def _apply_task_dir(self) -> None:
         """把沙箱上下文与系统提示词切换到当前任务目录。"""
@@ -294,6 +345,14 @@ class AgentLoop:
             result.usage = dict(self._usage)
             result.compacted = self.history.compact_count
             self._save_session(result)
+            # 本次任务改过文件 → 归档一份完整快照到 .agent_backups/
+            try:
+                snap = self.snapshot_to_backups()
+                if snap is not None:
+                    result.backup_dir = str(snap)
+            except OSError as exc:          # 备份失败不该把任务结果带走
+                if self.console:
+                    self.console.warn(f"备份失败（不影响任务结果）：{exc}")
 
         return result
 

@@ -27,11 +27,20 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
-# ---- Agent 默认工作区：所有生成物都落在这里，不入库 ----
-workspace/
+# ---- Agent 默认工作区：所有任务的最新代码，不入库 ----
+workplace/
+
+# ---- 历史备份：与 workplace 同级，不入库 ----
+.agent_backups/
 
 # ---- Agent 自己产生的垃圾 ----
 scratch/
 tmp/
 .DS_Store
 Thumbs.db
+
+# ---- 问答备份压缩包（按规范无需管理）----
+*.zip
+
+# ---- 编辑器配置 ----
+.vscode/

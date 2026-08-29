@@ -35,9 +35,9 @@ BANNER_HELP = """\
   /config            显示当前生效配置（密钥自动打码）
   /stats             显示本次会话的统计信息
   /compact           手动压缩上下文
-  /undo              撤销最近一次文件写入（从 .agent_backups 恢复）
-  /new [名字]        开启新的任务目录，后续代码放进新文件夹
-  /dir               显示当前任务目录
+  /undo              撤销最近一次文件写入（覆盖写前自动备份）
+  /new [任务名]      切换到另一个任务；同名任务沿用 workplace 下已有目录
+  /dir               显示当前任务名与目录
   /save [路径]       把当前对话导出为 JSONL
   !<命令>            直接执行 shell 命令（不经过模型）
 其余内容作为自然语言任务发送给智能体。
@@ -77,6 +77,8 @@ def build_argparser() -> argparse.ArgumentParser:
                "  python run.py --mock -t \"离线演示\"\n",
     )
     p.add_argument("-t", "--task", help="单次任务：执行完后退出")
+    p.add_argument("-n", "--name", help="任务名：决定 workplace/ 下的文件夹名，"
+                                        "同名任务复用同一目录（不指定则由任务描述自动生成）")
     p.add_argument("-c", "--config", help="配置文件路径（默认依次查找 config.yaml/json）")
     p.add_argument("-p", "--profile", help="选择 config.yaml 中的模型档位")
     p.add_argument("-w", "--workspace", help="工作区根目录（沙箱边界）")
@@ -163,10 +165,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ---- 单次任务 ----
     if args.task:
-        # 先建好目录再跑，用户等待时就知道产物会落在哪
-        console.info(f"任务目录：{loop.prepare_task_dir(args.task)}")
+        # 先定好目录再跑，用户等待时就知道产物会落在哪
+        task_dir = loop.prepare_task_dir(args.task, task_name=args.name)
+        console.info(f"任务「{loop.task_name}」→ {task_dir}")
         result = loop.run(args.task)
         console.final(result.answer)
+        if result.backup_dir:
+            console.info(f"已归档备份：{result.backup_dir}")
         console.stats({"步数": result.steps, "工具调用": result.tool_calls,
                        "失败": result.errors, "耗时": f"{result.elapsed:.1f}s",
                        "结束原因": result.finish_reason})
@@ -222,15 +227,14 @@ def _repl(loop: AgentLoop, console: Console) -> int:
                 else:
                     console.info("无需压缩（历史较短）。")
             elif cmd == "/undo":
-                console.echo(_undo(loop.console, loop.config))
+                console.echo(_undo(loop.console, loop.config, loop.task_name))
             elif cmd == "/new":
                 parts = raw.split(maxsplit=1)
-                hint = parts[1] if len(parts) > 1 else "新任务"
-                d = loop.prepare_task_dir(hint, force_new=True)
-                console.info(f"已开启新的任务目录：{d}")
+                name = parts[1].strip() if len(parts) > 1 else ""
+                d = loop.prepare_task_dir("新任务", task_name=name, force_new=True)
+                console.info(f"已开启新任务「{loop.task_name}」→ {d}")
             elif cmd == "/dir":
-                d = loop.task_dir
-                console.info(f"当前任务目录：{d if d else '（尚未开始任务）'}")
+                console.info(f"当前任务「{loop.task_name or '尚未开始'}」→ {loop.task_dir or '—'}")
             elif cmd == "/save":
                 parts = raw.split(maxsplit=1)
                 path = parts[1] if len(parts) > 1 else "session.jsonl"
@@ -259,20 +263,33 @@ def _repl(loop: AgentLoop, console: Console) -> int:
             continue
         # 只在新建目录时提示，追问沿用同一目录时不打扰
         if loop.task_dir != prev_dir:
-            console.info(f"任务目录：{loop.task_dir}")
+            console.info(f"任务「{loop.task_name}」→ {loop.task_dir}")
+        if result.backup_dir:
+            console.info(f"已归档备份：{result.backup_dir}")
         console.final(result.answer)
         console.echo(console._c("  " + result.stats_line(), "\033[90m") if console.color else "  " + result.stats_line())
 
 
-def _undo(console: Optional[Console], config) -> str:
-    """把最近一次备份的文件恢复回去。"""
-    root = config.resolved_workspace() / getattr(config, "backup_dir", ".agent_backups")
+def _undo(console: Optional[Console], config, task_name: Optional[str] = None) -> str:
+    """把最近一次"覆盖写"备份的文件恢复回去。
+
+    只回滚 .overwrites 下的单文件备份；任务级完整快照（<任务名>_<时间戳>_<第N次>）
+    是归档用的，不会被 /undo 改动，需要时直接去 .agent_backups 里拷贝即可。
+    """
+    home = getattr(config, "workspace_root", None) or config.workspace
+    base = Path(str(home)).expanduser().resolve().parent
+    root = base / (getattr(config, "backup_dir", None) or ".agent_backups") / ".overwrites"
+    if task_name:
+        root = root / task_name
     if not root.exists():
-        return "没有找到任何备份（.agent_backups 不存在）。"
-    stamps = sorted(p.name for p in root.iterdir() if p.is_dir())
-    if not stamps:
-        return "没有找到任何备份。"
-    latest = root / stamps[-1]
+        return "没有找到任何覆盖写备份（.agent_backups/.overwrites 不存在）。"
+
+    # 备份目录形如 .overwrites/<任务名>/<时间戳>/，取时间戳最大的那个
+    candidates = sorted((p for p in root.rglob("*") if p.is_dir() and any(p.iterdir())),
+                        key=lambda x: x.name)
+    if not candidates:
+        return "没有找到任何覆盖写备份。"
+    latest = candidates[-1]
     restored = []
     for src in latest.rglob("*"):
         if src.is_file():

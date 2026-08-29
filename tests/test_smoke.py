@@ -244,54 +244,83 @@ def test_config_env_placeholder_expansion(tmp_path=None):
 
 
 # ----------------------------------------------------------------------------
-# 11) 任务级子目录
+# 11) 任务目录（workplace/{任务名}）与历史备份（.agent_backups/{任务名}_{时间戳}_{第N次}）
 # ----------------------------------------------------------------------------
-def test_per_task_dir_isolates_each_task():
-    """开启 per_task_dir 后：每个任务独占一个子目录，代码与备份都归拢在里面。"""
+def test_task_dir_named_by_task_and_snapshotted():
+    """workplace 存最新代码；.agent_backups 与其同级，按"第N次"累计历史快照。"""
     with tempfile.TemporaryDirectory() as tmp:
-        cfg, profile, registry, _ = _make_env(tmp, per_task_dir=True, backup_on_write=True)
-        script = [
-            {"content": "写文件。", "tool_calls": [
-                {"name": "write_file", "arguments": {"path": "a.py", "content": "print('hi')\n"}}]},
-            {"content": "覆盖写一次，用于触发备份。", "tool_calls": [
-                {"name": "write_file", "arguments": {"path": "a.py", "content": "print('hi2')\n"}}]},
-            {"content": "完成。", "tool_calls": [
-                {"name": "finish", "arguments": {"summary": "done"}}]},
-        ]
-        backend = MockBackend(profile, script)
-        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        home = Path(tmp) / "workplace"                  # 生成代码的家
+        cfg = AgentConfig(workspace=str(home), session_log=None,
+                          per_task_dir=True, backup_on_write=True)
+        profile = LLMProfile(native_tools=True, api_key="test", model="mock")
+        registry = build_default_registry()
+        backup_root = Path(tmp) / ".agent_backups"      # 与 workplace 同级
 
-        result = loop.run("写一个快排脚本")
-        assert result.succeeded, result.error_message
+        def run_task(name: str, path: str, content: str):
+            script = [
+                {"content": "写文件。", "tool_calls": [
+                    {"name": "write_file", "arguments": {"path": path, "content": content}}]},
+                {"content": "完成。", "tool_calls": [
+                    {"name": "finish", "arguments": {"summary": "done"}}]},
+            ]
+            loop = AgentLoop(cfg, profile, MockBackend(profile, script), registry, console=None)
+            loop.prepare_task_dir("任务描述", task_name=name)
+            res = loop.run("任务描述")
+            assert res.succeeded, res.error_message
+            return loop, res
 
-        # 产物不在工作区根目录，而在唯一的任务子目录里
-        entries = list(Path(tmp).iterdir())
-        assert len(entries) == 1, f"工作区根目录应只有 1 个任务子目录，实际：{entries}"
-        task_dir = entries[0]
-        assert task_dir.is_dir()
-        assert re.match(r"^\d{8}-\d{6}", task_dir.name), f"子目录名应带时间戳前缀：{task_dir.name}"
-        assert "快排" in task_dir.name, f"子目录名应含任务摘要：{task_dir.name}"
+        # --- 第 1 次：目录名就是任务名，并归档"第1次"快照 ---
+        loop1, res1 = run_task("user_login", "login.py", "print('v1')\n")
+        task_dir = loop1.task_dir
+        assert task_dir == home / "user_login", f"目录名应为任务名，实际 {task_dir}"
+        assert (task_dir / "login.py").read_text(encoding="utf-8") == "print('v1')\n"
 
-        # 代码与备份都归拢在该任务目录内
-        assert (task_dir / "a.py").exists(), "代码应落在任务子目录里"
-        assert (task_dir / "a.py").read_text(encoding="utf-8") == "print('hi2')\n"
-        backup_root = task_dir / ".agent_backups"
-        assert backup_root.exists(), "备份目录应跟着任务走，而不是散在全局"
-        assert any(backup_root.rglob("*.py")), "覆盖写应产生备份文件"
+        snaps = sorted(p.name for p in backup_root.iterdir() if p.is_dir() and p.name != ".overwrites")
+        assert len(snaps) == 1, f"应产生 1 份快照，实际 {snaps}"
+        assert re.match(r"^user_login_\d{8}_\d{6}_第1次$", snaps[0]), f"命名不符：{snaps[0]}"
+        assert (backup_root / snaps[0] / "login.py").read_text(encoding="utf-8") == "print('v1')\n"
+        assert res1.backup_dir == str(backup_root / snaps[0]), "RunResult 应记录本次归档目录"
 
-        # 同一会话内追问：沿用同一目录（否则模型看不到上一轮刚生成的文件）
-        backend2 = MockBackend(profile, [
-            {"content": "完成。", "tool_calls": [{"name": "finish", "arguments": {"summary": "ok"}}]}])
-        followup = AgentLoop(cfg, profile, backend2, registry, console=None)
-        followup._task_dir = task_dir                 # 模拟同一会话继续
-        followup.run("改成降序输出")
-        assert followup.task_dir == task_dir, "同会话追问应沿用同一任务目录"
+        # --- 第 2 次：同名任务复用同一目录，workplace 保持最新，快照变"第2次" ---
+        loop2, _ = run_task("user_login", "login.py", "print('v2')\n")
+        assert loop2.task_dir == task_dir, "同名任务应复用同一目录"
+        assert (task_dir / "login.py").read_text(encoding="utf-8") == "print('v2')\n", \
+            "workplace 里应始终是最新代码"
 
-        # /new 开启新目录：新目录仍在工作区根下（不套娃），旧任务文件不受影响
-        newer = followup.prepare_task_dir("另一个任务", force_new=True)
-        assert newer != task_dir, "/new 应创建新目录"
-        assert newer.parent == Path(tmp), "新目录应直接建在工作区根下，而不是套在旧任务里"
-        assert (task_dir / "a.py").exists(), "旧任务目录里的文件不应被动过"
+        snaps = sorted(p.name for p in backup_root.iterdir() if p.is_dir() and p.name != ".overwrites")
+        assert len(snaps) == 2, f"应累计 2 份快照，实际 {snaps}"
+        assert any("第2次" in s for s in snaps), f"应出现第2次：{snaps}"
+        # 两次快照各自保留当时的版本，不被后续覆盖
+        assert (backup_root / snaps[0] / "login.py").read_text(encoding="utf-8") == "print('v1')\n"
+        assert (backup_root / snaps[1] / "login.py").read_text(encoding="utf-8") == "print('v2')\n"
+
+        # --- 另一个任务：独立目录、独立计数 ---
+        run_task("word_count", "wc.py", "print('wc')\n")
+        assert (home / "word_count" / "wc.py").exists()
+        wc_snaps = [p.name for p in backup_root.iterdir()
+                    if p.is_dir() and p.name.startswith("word_count_")]
+        assert len(wc_snaps) == 1 and "第1次" in wc_snaps[0], f"{wc_snaps}"
+
+        # 覆盖写的单文件备份收在 .overwrites 下，不污染顶层快照命名
+        assert (backup_root / ".overwrites").exists(), "覆盖写应有单独归档位置"
+        top = [p.name for p in backup_root.iterdir() if p.is_dir()]
+        assert sorted(n for n in top if n != ".overwrites") == sorted(snaps + wc_snaps)
+
+
+def test_task_name_defaults_to_slug_of_task():
+    """不指定任务名时，由任务描述自动生成目录名。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp) / "workplace"
+        cfg = AgentConfig(workspace=str(home), session_log=None, per_task_dir=True)
+        profile = LLMProfile(native_tools=True, api_key="test", model="mock")
+        registry = build_default_registry()
+        script = [{"content": "完成。", "tool_calls": [
+            {"name": "finish", "arguments": {"summary": "ok"}}]}]
+        loop = AgentLoop(cfg, profile, MockBackend(profile, script), registry, console=None)
+
+        loop.run("写一个冒泡排序 bubble_sort.py，可直接运行并自测")
+        assert loop.task_name == "写一个冒泡排序-bubble_sort", f"实际：{loop.task_name}"
+        assert loop.task_dir == home / "写一个冒泡排序-bubble_sort"
 
 
 # ----------------------------------------------------------------------------
