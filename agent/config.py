@@ -55,6 +55,9 @@ class LLMProfile:
     name: str = "default"
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
+    # 备用密钥：当前 key 报 401/403/429 或额度耗尽时按顺序自动轮换。
+    # 留空则等价于只有 api_key 一把钥匙，行为与之前完全一致。
+    api_keys: List[str] = field(default_factory=list)
     model: str = "gpt-4o-mini"
     temperature: float = 0.2
     top_p: float = 1.0
@@ -71,6 +74,8 @@ class LLMProfile:
         data = asdict(self)
         key = data.get("api_key") or ""
         data["api_key"] = (key[:6] + "***" + key[-4:]) if len(key) > 12 else ("***" if key else "<未设置>")
+        keys = data.get("api_keys") or []
+        data["api_keys"] = [f"<key {i + 1} 已配置>" for i in range(len(keys))]
         return data
 
 

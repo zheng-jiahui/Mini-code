@@ -91,10 +91,46 @@ class LLMBackend(ABC):
 
     def __init__(self, profile: LLMProfile):
         self.profile = profile
+        # 密钥池：以 api_keys 为准，api_key 作为首个候选补在前面
+        self._keys: List[str] = [k for k in (profile.api_keys or []) if k]
+        if profile.api_key and profile.api_key not in self._keys:
+            self._keys.insert(0, profile.api_key)
+        self._key_index = 0
+        self.on_key_rotate: Optional[Callable[[int, int], None]] = None
 
     @property
     def supports_native_tools(self) -> bool:
         return self.profile.native_tools
+
+    # ---------------- 密钥轮换 ----------------
+    def _rotate_key(self) -> bool:
+        """切换到下一把密钥；没有更多候选时返回 False。"""
+        if len(self._keys) < 2:
+            return False
+        nxt = self._key_index + 1
+        if nxt >= len(self._keys):
+            return False                      # 已用完，不再绕回第一个
+        self._key_index = nxt
+        self.profile.api_key = self._keys[nxt]
+        self._rebuild_client()
+        if self.on_key_rotate:
+            try:
+                self.on_key_rotate(nxt, len(self._keys))
+            except Exception:                 # 回调出错不能影响主流程
+                pass
+        return True
+
+    def _rebuild_client(self) -> None:
+        """密钥变更后重建底层客户端；用不到长连接的子类无需实现。"""
+
+    @staticmethod
+    def _should_rotate(exc: "LLMError") -> bool:
+        """哪些错误值得换 key：鉴权失败、限流、额度耗尽。"""
+        if getattr(exc, "status", None) in (401, 403, 429):
+            return True
+        text = str(exc).lower()
+        return any(k in text for k in
+                   ("quota", "insufficient", "balance", "额度", "余额", "无效的令牌", "invalid token"))
 
     @abstractmethod
     def _send(
@@ -128,6 +164,8 @@ class LLMBackend(ABC):
         """
         retries = max(0, int(self.profile.max_retries))
         last_exc: Optional[BaseException] = None
+        rotations = 0
+        max_rotations = max(0, len(self._keys) - 1)
 
         for attempt in range(retries + 1):
             try:
@@ -137,6 +175,10 @@ class LLMBackend(ABC):
                 return msg
             except LLMError as exc:
                 last_exc = exc
+                # 凭据/配额类错误：换一把钥匙再试，对同一把 key 重试没有意义
+                if rotations < max_rotations and self._should_rotate(exc) and self._rotate_key():
+                    rotations += 1
+                    continue
                 if not exc.retryable or attempt >= retries:
                     raise
             except Exception as exc:  # 兜底：把 SDK/requests 的异常翻译成 LLMError
@@ -166,13 +208,24 @@ class OpenAIBackend(LLMBackend):
         except ImportError as exc:  # pragma: no cover
             raise ConfigError("未安装 openai SDK，请 pip install openai，或改用 --backend http") from exc
 
-        self._client = OpenAI(
-            api_key=profile.api_key,
-            base_url=profile.base_url,
-            timeout=profile.timeout,
+        self._OpenAI = OpenAI
+        self._client = self._build_client()
+
+    def _build_client(self):
+        return self._OpenAI(
+            api_key=self.profile.api_key,
+            base_url=self.profile.base_url,
+            timeout=self.profile.timeout,
             max_retries=0,  # 重试由本模块统一控制，避免双重重试
-            default_headers=profile.extra_headers or None,
+            default_headers=self.profile.extra_headers or None,
         )
+
+    def _rebuild_client(self) -> None:
+        """轮换密钥后必须重建客户端——SDK 的 api_key 是在构造时固定的。
+
+        空实现会让轮换失效：profile.api_key 换了，但 self._client 仍持有旧密钥。
+        """
+        self._client = self._build_client()
 
     def _send(self, messages, tools=None, tool_choice=None) -> AssistantMessage:
         kwargs: Dict[str, Any] = {

@@ -457,6 +457,45 @@ def test_edit_block_reports_not_found_with_hints():
 
 
 # ----------------------------------------------------------------------------
+# 15) 多密钥轮换
+# ----------------------------------------------------------------------------
+def test_key_rotation_rebuilds_client():
+    """轮换后客户端必须重建，否则 profile 换了新 key、请求却仍用旧 key。
+
+    SDK 的 api_key 在构造时固定，_rebuild_client 空实现会让轮换形同虚设。
+    """
+    from agent.llm import OpenAIBackend
+
+    profile = LLMProfile(api_key="sk-aaa", api_keys=["sk-bbb", "sk-ccc"],
+                         native_tools=False, base_url="https://example.invalid/v1")
+    backend = OpenAIBackend(profile)
+    assert backend._client.api_key == "sk-aaa", "初始应持主密钥"
+
+    assert backend._rotate_key() is True
+    assert profile.api_key == "sk-bbb"
+    assert backend._client.api_key == "sk-bbb", "轮换后客户端必须重建，否则仍用旧密钥发请求"
+
+    assert backend._rotate_key() is True
+    assert backend._client.api_key == "sk-ccc"
+
+    assert backend._rotate_key() is False, "密钥用完后不应绕回第一个"
+    assert backend._client.api_key == "sk-ccc"
+
+
+def test_should_rotate_only_on_credential_errors():
+    """只有凭据/配额类错误值得换 key，普通错误轮换没有意义。"""
+    from agent.errors import LLMError
+    from agent.llm import LLMBackend
+
+    assert LLMBackend._should_rotate(LLMError("无效的令牌", status=401))
+    assert LLMBackend._should_rotate(LLMError("rate limited", status=429))
+    assert LLMBackend._should_rotate(LLMError("quota exceeded"))
+    assert LLMBackend._should_rotate(LLMError("余额不足"))
+    assert not LLMBackend._should_rotate(LLMError("upstream boom", status=500))
+    assert not LLMBackend._should_rotate(LLMError("connection timeout"))
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
