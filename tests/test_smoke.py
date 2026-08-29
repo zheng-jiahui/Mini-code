@@ -577,6 +577,70 @@ def test_detect_test_command():
         assert detect_test_command(tmp) is None
 
 
+def test_detect_test_command_covers_java_and_other_stacks():
+    """多语言适配：补齐 Java（Maven/Gradle），且 wrapper 调用方式要分平台。
+
+    Windows 下 run_command 走 cmd.exe，`./mvnw` 这类 POSIX 写法跑不通，
+    必须用 `mvnw.cmd` —— 否则探测出一个必然失败的命令，白白浪费自修复预算。
+    """
+    from agent.selfrepair import detect_test_command
+    windows = os.name == "nt"
+
+    def probe(files):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, content in files.items():
+                Path(tmp, name).write_text(content, encoding="utf-8")
+            return detect_test_command(tmp)
+
+    assert probe({"pom.xml": "<project/>"}) == "mvn -q test"
+    assert probe({"pom.xml": "<project/>", "mvnw.cmd": ""}) == \
+        ("mvnw.cmd -q test" if windows else "mvnw -q test")
+    assert probe({"pom.xml": "<project/>", "mvnw": ""}) == \
+        ("mvnw -q test" if windows else "./mvnw -q test")
+    assert probe({"build.gradle": ""}) == "gradle test"
+    assert probe({"build.gradle.kts": "", "gradlew.bat": ""}) == \
+        ("gradlew test" if windows else "./gradlew test")
+    assert probe({"tox.ini": "[tox]"}) == "tox"
+    assert probe({"Cargo.toml": ""}) == "cargo test"
+    assert probe({"package.json": "{}", "yarn.lock": ""}) == "yarn test"
+
+
+def test_detect_test_command_does_not_abort_scan_early():
+    """回归：探测链不能在单个标记文件上提前终止。
+
+    早期实现遇到没有 [tool.pytest] 的 pyproject.toml 直接 `return None`，
+    而现代 Python 项目几乎都有 pyproject.toml —— 探测链在最常见的文件上就断了，
+    后面的 go.mod、测试文件命名约定全都没机会被检查。
+    """
+    from agent.selfrepair import detect_test_command
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "pyproject.toml").write_text('[project]\nname = "demo"\n', encoding="utf-8")
+        Path(tmp, "test_demo.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        assert detect_test_command(tmp) == "pytest -q", "应继续往下探，靠命名约定兜底"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # 没有 [tool.pytest] 时不该假装是 pytest 项目，应让位给更明确的信号
+        Path(tmp, "pyproject.toml").write_text('[project]\nname = "demo"\n', encoding="utf-8")
+        Path(tmp, "go.mod").write_text("module demo\n", encoding="utf-8")
+        assert detect_test_command(tmp) == "go test ./..."
+
+
+def test_detect_test_command_skips_doomed_commands():
+    """Makefile 里没有 test 目标时不要建议 `make test`。
+
+    `make test` 会直接报 "No rule to make target 'test'" ——
+    回灌一条注定失败的命令比不给建议更糟。
+    """
+    from agent.selfrepair import detect_test_command
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "Makefile").write_text("all:\n\techo hi\n", encoding="utf-8")
+        assert detect_test_command(tmp) is None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "Makefile").write_text("all:\n\techo hi\n\ntest:\n\tpytest -q\n", encoding="utf-8")
+        assert detect_test_command(tmp) == "make test"
+
+
 def test_build_failure_note_reads_offending_lines():
     from agent.selfrepair import build_failure_note
     with tempfile.TemporaryDirectory() as tmp:
