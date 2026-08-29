@@ -952,6 +952,46 @@ def test_every_tool_documents_when_not_to_use_it():
     assert not missing, f"这些工具缺少 when_not_to_use：{missing}"
 
 
+def test_command_timeout_is_clamped_to_a_hard_cap():
+    """模型传的 timeout 必须被夹到上限内，否则一条命令能把整个会话挂死几小时。
+
+    把模型的输出当不可信输入处理——和路径沙箱是同一类边界。
+    """
+    from agent.tools.shell import _resolve_timeout
+
+    class Cfg:
+        command_timeout = 120
+        max_command_timeout = 300
+
+    cfg = Cfg()
+    assert _resolve_timeout(None, cfg)[0] == 120                  # 不传 → 用默认
+    assert _resolve_timeout(30, cfg)[0] == 30                     # 合理值照用
+    assert _resolve_timeout(99999, cfg)[0] == 300                 # 荒谬值 → 夹到上限
+    assert "超过上限" in _resolve_timeout(99999, cfg)[1]           # 并告知模型被夹了
+    assert _resolve_timeout(0, cfg)[0] == 120                     # 非法 → 退回默认
+    assert _resolve_timeout(-5, cfg)[0] == 120
+    assert _resolve_timeout("abc", cfg)[0] == 120                 # 非数字不抛异常
+
+
+def test_run_command_survives_absurd_timeout_and_reports_partial_output():
+    """端到端：传一个荒谬 timeout 也要在可控时间内返回，且给出部分输出。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, ctx = _make_env(tmp)
+        ctx.config.max_command_timeout = 3   # 上限压到 3s，别让测试真等 300s
+        # 先打印一行再睡很久——验证超时后仍拿得到"终止前的部分输出"
+        r = registry.execute("run_command", {
+            "command": 'echo before-sleep && python -c "import time; time.sleep(60)"',
+            "timeout": 99999,
+        }, ctx)
+        assert not r.ok
+        text = r.render()
+        assert "before-sleep" in text, "超时也应保留已产生的部分输出"
+        assert "超过上限" in text, "应告知模型 timeout 被夹取了"
+        assert "不要原样重试" in text, "超时提示要给出可行动的下一步，而不只是报错"
+        assert "只能靠缩小范围" in text, "已到上限时不应再建议加大 timeout"
+        assert r.meta["timed_out"] is True
+
+
 def test_guardrail_reaches_model_on_both_channels():
     """反向文档必须让模型在**两条通道**上都看到，否则等于没写。
 

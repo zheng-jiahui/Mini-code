@@ -28,6 +28,39 @@ from .base import ToolContext, ToolResult, tool_spec
 __all__ = ["run_command", "register"]
 
 
+def _resolve_timeout(raw: Any, config: Any) -> tuple:
+    """把模型传入的 timeout 收敛到 [1, 上限] 区间，并返回给模型的说明。
+
+    为什么必须夹取上限：模型偶尔会传一个荒谬的值（如 99999），
+    没有上限的话整条会话会挂死好几个小时，用户只能杀进程。
+    这是"把模型的输出当不可信输入处理"，和路径沙箱是同一类边界。
+
+    为什么不自动重试失败的命令：shell 命令可能有副作用（装依赖、写文件、
+    提交），重试不等于重放——重复执行很可能造成重复副作用。
+    所以这里只做"把诊断和建议讲清楚"，是否重试交给模型判断。
+
+    ⚠️ 辅助函数必须定义在 @tool_spec 装饰器**之前**：装饰器紧贴它下面的第一个
+    def，插在中间会让装饰器挂到辅助函数上，工具就退化成裸函数了。
+    """
+    default_timeout = int(getattr(config, "command_timeout", 120) or 120)
+    cap = int(getattr(config, "max_command_timeout", 300) or 300)
+    if cap < 1:
+        cap = 300
+
+    try:
+        asked = int(raw) if raw is not None else default_timeout
+    except (TypeError, ValueError):
+        # 模型传了非数字——不要用异常打断工具，退回默认值并告知
+        asked = default_timeout
+
+    if asked <= 0:
+        asked = default_timeout
+
+    if asked > cap:
+        return cap, f"（你请求的 timeout={asked}s 超过上限，已按 {cap}s 执行）"
+    return asked, ""
+
+
 @tool_spec(
     name="run_command",
     description=(
@@ -74,7 +107,7 @@ def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     cwd = ctx.resolve(cwd_arg, must_exist=True)
     if not cwd.is_dir():
         raise ToolError(f"cwd 不是目录：{cwd_arg}", tool="run_command")
-    timeout = int(args.get("timeout") or getattr(ctx.config, "command_timeout", 120))
+    timeout, timeout_note = _resolve_timeout(args.get("timeout"), ctx.config)
 
     # 3) 构造环境
     env = os.environ.copy()
@@ -164,6 +197,8 @@ def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     ctx.record_change("command", command[:120])
 
     parts = [started_note]
+    if timeout_note:
+        parts.append(timeout_note)
     if output.strip():
         parts.append(output.rstrip())
     else:
@@ -175,7 +210,21 @@ def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
             "请改用非交互式命令（例如用 `pytest -q` 而非会等待输入的 `pytest`）。"
         )
     if timed_out:
-        parts.append(f"[超时] 命令执行超过 {timeout}s 已被终止（以上为终止前的部分输出）。")
+        # 只说"超时了"没用——模型会原样重试一次，再白耗同样多的时间。
+        # 超时往往意味着范围太大（跑整个测试套件、全量构建），
+        # 所以把"怎么缩小"和"确实需要更久时怎么办"一起讲清楚。
+        cap = int(getattr(ctx.config, "max_command_timeout", 300) or 300)
+        if timeout < cap:
+            next_step = (f"② 若确实需要更久，显式传 timeout（上限 {cap}s）："
+                         f'run_command(command="…", timeout={cap})；')
+        else:
+            next_step = f"② 本次已是上限 {cap}s，只能靠缩小范围，不能再加时间；"
+        parts.append(
+            f"[超时] 命令执行超过 {timeout}s 已被终止（以上为终止前的部分输出）。\n"
+            f"下一步建议：① 缩小范围再跑（如 `pytest -q tests/test_x.py` 而非整个套件）；\n"
+            f"{next_step}\n"
+            f"③ 不要原样重试同一条命令，大概率还是超时。"
+        )
     parts.append(f"[exit code: {exit_code}]")
 
     ok = (exit_code == 0) and not timed_out and not interactive_killed
