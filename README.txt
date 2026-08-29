@@ -16,7 +16,7 @@
    workplace/任务名/                          该任务的最新代码
    .agent_backups/任务名_时间戳_第N次/        每次生成的完整归档，序号自动递增
    .overwrites/                              覆盖写单文件备份，供 /undo 回滚
-5) 测试：python tests/test_smoke.py（64 个用例，无需 API key）
+5) 测试：python tests/test_smoke.py（68 个用例，无需 API key）
         python tests/test_fake_server.py（本地假服务端，验证 HTTP 协议链路）
 
 二、特色功能

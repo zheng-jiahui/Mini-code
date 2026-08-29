@@ -327,3 +327,27 @@ agent/loop.py          主循环（编排者）：调模型→解析→执行工
 - 把系统提示词写成角色扮演剧本；
 - 在提示词里硬编码工具名但代码未注册（一致性靠 registry 动态注入保证）；
 - 一条规则同时承担两种含义（本项目反复踩坑，如 `None` 既是"文件不存在"又是"没采集"）。
+
+---
+
+## 7. 真实端点验证（v0.1.0 · NSCC MaaS Qwen3.5）
+
+极小任务端到端跑通（REPL 单次任务，`--max-steps 5`，无需人工干预）：
+`write_file(hello.py)` → `run_command(python hello.py 输出 hello)` → `finish`。
+结果：**步数=3 · 工具调用=3 · 失败=0 · 耗时=4.8s · 结束原因=finish**。
+
+完整轨迹（节选，已隐去密钥）：
+
+```
+[1/5] Qwen3.5 ▸ 我来创建 hello.py 文件并验证。
+      ▶ write_file(path=hello.py, content=print("hello"))
+      ✔ write_file · 0.00s
+[2/5] … Qwen3.5
+      ▶ run_command(command=python hello.py)
+      ✔ run_command · 0.42s  →  $ python hello.py  →  hello  (exit 0)
+[3/5] … Qwen3.5
+      ▶ finish(summary=① 创建 hello.py … ② 运行验证输出 hello … ③ 无遗留问题)
+```
+
+说明：流式输出（正文逐字打印）、原生 function calling、假完成拦截（先验证再 finish）、
+上下文预算提示均按设计生效；离线 68 测试全绿，真实端点单步任务亦通过。
