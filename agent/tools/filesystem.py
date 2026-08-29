@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,7 @@ from ..errors import SecurityError, ToolError
 from ..security import truncate_output
 from .base import ToolContext, ToolResult, ToolSpec, tool_spec
 
-__all__ = ["read_file", "write_file", "list_dir", "register"]
+__all__ = ["read_file", "write_file", "edit_block", "list_dir", "register"]
 
 _IGNORE_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv",
@@ -162,6 +163,99 @@ def write_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 
 # ----------------------------------------------------------------------------
+# edit_block —— 精确替换（改大文件里的少量内容时必须用它）
+# ----------------------------------------------------------------------------
+@tool_spec(
+    name="edit_block",
+    description=(
+        "精确替换文件中的一段文本：用 old_text 定位，替换成 new_text，文件其余部分原样保留。\n"
+        "old_text 在文件中必须**唯一**；若不唯一，会返回每一处的行号，"
+        "你补更多上下文后重试即可（确要一次改多处时传 expected_replacements）。\n"
+        "修改已存在文件里的少量内容时**必须用本工具**——用 write_file 整体重写"
+        "会因输出过长被截断，甚至丢参数导致调用失败。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "文件路径，相对工作区"},
+            "old_text": {"type": "string", "description": "要被替换的原文片段（需唯一，不要抄行号）"},
+            "new_text": {"type": "string", "description": "替换后的新文本（空串表示删除该片段）"},
+            "expected_replacements": {
+                "type": "integer",
+                "description": "期望替换几处，默认 1；确要一次改多处时传对应数量",
+                "default": 1,
+            },
+        },
+        "required": ["path", "old_text", "new_text"],
+    },
+    category="文件",
+)
+def edit_block(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    target = ctx.resolve(args["path"], must_exist=True)
+    if target.is_dir():
+        raise ToolError(f"{args['path']} 是目录，不能编辑", tool="edit_block")
+
+    old_text = args.get("old_text")
+    new_text = args.get("new_text")
+    if old_text is None or new_text is None:
+        raise ToolError("old_text 与 new_text 都是必填参数", tool="edit_block")
+    if not str(old_text).strip():
+        raise ToolError("old_text 不能为空，否则无法定位", tool="edit_block")
+
+    try:
+        original = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise ToolError(f"读取失败：{exc}", tool="edit_block") from exc
+
+    # 模型常把 read_file 的行号一起抄进来，先尝试剥离后再匹配
+    needle, stripped = _normalize_needle(str(old_text), original)
+    matches = _find_all(original, needle)
+    expected = max(1, int(args.get("expected_replacements") or 1))
+
+    if not matches:
+        raise ToolError(
+            f"在 {_rel(ctx, target)} 中找不到 old_text",
+            tool="edit_block",
+            hint=_not_found_hint(original, needle),
+        )
+
+    if len(matches) != expected:
+        raise ToolError(
+            f"old_text 在 {_rel(ctx, target)} 中匹配到 {len(matches)} 处，"
+            f"但 expected_replacements={expected}。不唯一时拒绝替换，以免改错位置。",
+            tool="edit_block",
+            hint="请补更多上下文让 old_text 唯一，或传入正确的 expected_replacements：\n"
+                 + _render_matches(original, matches, needle),
+        )
+
+    backup_path = ""
+    if getattr(ctx.config, "backup_on_write", True):
+        backup_path = _backup(ctx, target)
+
+    new_content = original.replace(needle, str(new_text), expected)
+    try:
+        target.write_text(new_content, encoding="utf-8", newline="")
+    except OSError as exc:
+        raise ToolError(f"写入失败：{exc}", tool="edit_block",
+                        hint="文件可能只读或被其它程序占用。") from exc
+
+    ctx.record_change("edit", _rel(ctx, target))
+
+    line_no = original.count("\n", 0, matches[0]) + 1
+    delta = len(new_content.splitlines()) - len(original.splitlines())
+    detail = (f"已替换 {_rel(ctx, target)} 第 {line_no} 行起的 "
+              f"{len(needle.splitlines())} 行（共 {len(matches)} 处），"
+              f"行数变化 {'+' if delta >= 0 else ''}{delta}")
+    if stripped:
+        detail += "\n提示：old_text 里带了行号前缀，已自动剥离后匹配；下次请不要抄行号。"
+    if backup_path:
+        detail += f"\n原文件已备份至 {backup_path}"
+    return ToolResult.success(
+        detail, meta={"path": str(target), "line": line_no, "backup": backup_path}
+    )
+
+
+# ----------------------------------------------------------------------------
 # list_dir
 # ----------------------------------------------------------------------------
 @tool_spec(
@@ -219,6 +313,71 @@ def list_dir(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 # ----------------------------------------------------------------------------
 # 辅助
 # ----------------------------------------------------------------------------
+# ---- edit_block 的匹配辅助 ----
+# read_file 的输出形如 "   12| def f():"，模型常把行号一起抄进 old_text
+_LINE_NO_PREFIX = re.compile(r"^\s*\d+\|\s")
+
+
+def _normalize_needle(old_text: str, original: str):
+    """返回 (实际用于匹配的文本, 是否剥离过行号)。
+
+    直接匹配失败时，尝试剥离行号前缀再匹配——能救回大量
+    "内容明明一样却找不到" 的情况，同时回执里会提醒模型别再抄行号。
+    """
+    if old_text in original:
+        return old_text, False
+    lines = old_text.splitlines()
+    stripped = [_LINE_NO_PREFIX.sub("", ln) for ln in lines]
+    if stripped != lines:
+        candidate = "\n".join(stripped)
+        if old_text.endswith("\n"):
+            candidate += "\n"
+        if candidate in original:
+            return candidate, True
+    return old_text, False
+
+
+def _find_all(text: str, needle: str) -> List[int]:
+    """needle 在 text 中所有匹配的起始字符偏移。"""
+    out: List[int] = []
+    start = 0
+    while True:
+        i = text.find(needle, start)
+        if i < 0:
+            break
+        out.append(i)
+        start = i + 1
+    return out
+
+
+def _render_matches(original: str, matches: List[int], needle: str) -> str:
+    """列出每处匹配的行号，帮模型决定补多少上下文。"""
+    out = []
+    for off in matches[:5]:
+        line_no = original.count("\n", 0, off) + 1
+        head = (needle.splitlines() or [""])[0].strip()[:60]
+        out.append(f"  第 {line_no} 行：{head}")
+    if len(matches) > 5:
+        out.append(f"  ...（共 {len(matches)} 处，仅列出前 5 处）")
+    return "\n".join(out)
+
+
+def _not_found_hint(original: str, needle: str) -> str:
+    """找不到时给出可操作的排查方向，并附上文件中最相近的几行。"""
+    msg = ["检查：① 是否误抄了 read_file 的行号；② 缩进与空白是否一致；③ 文件是否已被改动过。"]
+    first = (needle.splitlines() or [""])[0].strip()
+    if first:
+        hits = []
+        for i, line in enumerate(original.splitlines(), 1):
+            if first in line:
+                hits.append(f"  第 {i} 行：{line.strip()[:80]}")
+                if len(hits) >= 3:
+                    break
+        if hits:
+            msg.append("文件中存在相似内容：\n" + "\n".join(hits))
+    return "\n".join(msg)
+
+
 def _rel(ctx: ToolContext, path: Path) -> str:
     return ctx.guard.relpath(path)
 
@@ -272,4 +431,4 @@ def _backup(ctx: ToolContext, target: Path) -> str:
 
 def register(registry) -> None:
     """把本模块的工具注册进注册表。"""
-    registry.register_many([read_file, write_file, list_dir])
+    registry.register_many([read_file, write_file, edit_block, list_dir])

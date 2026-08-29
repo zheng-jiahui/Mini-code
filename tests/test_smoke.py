@@ -369,6 +369,94 @@ def test_correction_note_never_puts_system_after_start():
 
 
 # ----------------------------------------------------------------------------
+# 14) edit_block 精确编辑
+# ----------------------------------------------------------------------------
+def test_edit_block_replaces_unique_occurrence():
+    """精确替换：只改 old_text 那一处，文件其余部分原样保留。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        f = Path(tmp, "a.py")
+        f.write_text("def f():\n    return 1\n\n\ndef g():\n    return 2\n", encoding="utf-8")
+
+        res = registry.execute("edit_block", {
+            "path": "a.py",
+            "old_text": "def f():\n    return 1",
+            "new_text": "def f():\n    return 42",
+        }, ctx)
+        assert res.ok, res.render()
+
+        after = f.read_text(encoding="utf-8")
+        assert after == "def f():\n    return 42\n\n\ndef g():\n    return 2\n", after
+        assert "def g():\n    return 2" in after, "未涉及的部分不应被改动"
+
+
+def test_edit_block_refuses_ambiguous_match():
+    """old_text 不唯一时拒绝替换，列出所有匹配行号，且文件保持原样。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        f = Path(tmp, "a.py")
+        f.write_text("x = 1\nx = 1\ny = 2\n", encoding="utf-8")
+
+        res = registry.execute("edit_block", {
+            "path": "a.py", "old_text": "x = 1", "new_text": "x = 9",
+        }, ctx)
+        assert not res.ok, "不唯一时必须拒绝，否则可能改错位置"
+
+        text = res.render()
+        assert "匹配到 2 处" in text, text
+        assert "第 1 行" in text and "第 2 行" in text, f"应列出每处行号：{text}"
+        assert f.read_text(encoding="utf-8") == "x = 1\nx = 1\ny = 2\n", "失败时不应改动文件"
+
+
+def test_edit_block_strips_line_numbers_copied_from_read():
+    """模型把 read_file 的行号一起抄进来时，仍能匹配上。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        f = Path(tmp, "a.py")
+        f.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+        res = registry.execute("edit_block", {
+            "path": "a.py",
+            "old_text": "    2| beta",          # read_file 的行号格式："{:>5}| "
+            "new_text": "BETA",
+        }, ctx)
+        assert res.ok, res.render()
+        assert f.read_text(encoding="utf-8") == "alpha\nBETA\ngamma\n"
+        assert "行号" in res.render(), "回执应提醒模型不要抄行号"
+
+
+def test_edit_block_multiple_with_expected_replacements():
+    """明确传 expected_replacements 时可一次改多处。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        f = Path(tmp, "a.py")
+        f.write_text("x = 1\nx = 1\ny = 2\n", encoding="utf-8")
+
+        res = registry.execute("edit_block", {
+            "path": "a.py", "old_text": "x = 1", "new_text": "x = 9",
+            "expected_replacements": 2,
+        }, ctx)
+        assert res.ok, res.render()
+        assert f.read_text(encoding="utf-8") == "x = 9\nx = 9\ny = 2\n"
+
+
+def test_edit_block_reports_not_found_with_hints():
+    """找不到时给出排查方向，而不是让模型瞎猜。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        f = Path(tmp, "a.py")
+        f.write_text("alpha\nbeta\n", encoding="utf-8")
+
+        res = registry.execute("edit_block", {
+            "path": "a.py", "old_text": "完全不存在的一段", "new_text": "x",
+        }, ctx)
+        assert not res.ok
+        text = res.render()
+        assert "找不到" in text, text
+        assert "检查" in text, f"应给出排查提示：{text}"
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
