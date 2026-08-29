@@ -1403,6 +1403,51 @@ def test_system_prompt_mentions_clarify_parallel_and_decision_order():
 
 
 # ----------------------------------------------------------------------------
+# 健壮性边界（守护已有能力，不引入新代码）
+# ----------------------------------------------------------------------------
+def test_tool_result_render_redacts_secrets():
+    secret = "sk-1234567890abcdefghij"
+    res = ToolResult.success(f"调用成功，密钥是 {secret}")
+    out = res.render()
+    assert secret not in out, "工具回执不得原样泄露密钥"
+    assert "sk-***" in out, "密钥应被打码"
+
+
+def test_malformed_native_tool_args_surfaced_as_issue():
+    from agent.llm import ToolCall  # noqa: E402
+    registry = build_default_registry()
+    msg = AssistantMessage(
+        content="",
+        tool_calls=[ToolCall(id="c1", name="write_file", arguments={},
+                             raw_arguments="{这不是合法 json", malformed=True, source="native")],
+    )
+    outcome = ToolCallParser(registry, use_native=True).parse(msg)
+    assert not outcome.calls, "畸形参数的调用不应被执行"
+    assert any("合法 JSON" in i for i in outcome.issues), "必须给模型可自我修正的提示"
+
+
+def test_auto_compaction_triggers_when_over_budget():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        cfg.max_context_tokens = 150
+        cfg.reserve_tokens = 0
+        cfg.auto_compact = True
+        cfg.compact_threshold = 0.3
+        cfg.compact_keep_recent = 4
+        backend, profile = _scripted([], native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        # 灌入远超预算的历史
+        for i in range(6):
+            loop.history.add_assistant(AssistantMessage(content="x" * 2000))
+            loop.history.add_tool_result(f"id{i}", "read_file", "y" * 2000)
+        assert loop.history.compact_count == 0
+        loop._maybe_compact()
+        assert loop.history.compact_count == 1, "超预算应触发一次自动压缩"
+        # system 提示词必须保留
+        assert loop.history.messages[0]["role"] == "system"
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
