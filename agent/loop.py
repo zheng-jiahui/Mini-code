@@ -177,6 +177,8 @@ class AgentLoop:
         self._fingerprints: Deque[str] = deque(maxlen=6)
         self._stale_steps = 0
         self._consecutive_errors = 0
+        self._ran_command_this_run = False   # 本任务是否已跑过 run_command（假完成拦截用）
+        self._finish_blocked = 0             # finish 被"先验证"拦截的次数（最多 2 次，防死循环）
         self._usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     # ------------------------------------------------------------------
@@ -310,7 +312,10 @@ class AgentLoop:
         result = RunResult()
         # 每个任务一个独立子目录：首次进入时创建，同会话后续追问沿用
         result.task_dir = str(self.prepare_task_dir(task))
-        self.ctx.session.setdefault("changes", [])
+        # 每个任务清零"本次会话的副作用"与假完成拦截计数，保证语义是"本任务"而非跨任务累积
+        self.ctx.session["changes"] = []
+        self._ran_command_this_run = False
+        self._finish_blocked = 0
         self.ctx.session.pop("finished", None)
         self.ctx.session.pop("summary", None)
 
@@ -470,9 +475,26 @@ class AgentLoop:
             if self.console:
                 self.console.tool_call(call.name, call.arguments)
 
+            if call.name == "run_command":
+                self._ran_command_this_run = True
+
             # finish 是"控制类"工具：直接结束，不再把结果喂回模型
             if call.name == "finish":
                 summary = (call.arguments.get("summary") or "").strip()
+                # 「假完成」拦截：改过文件却从没运行过任何验证命令就收尾，
+                # 大概率是没测过的半成品。回灌提示逼它先验证（最多拦 2 次，避免死循环）。
+                wrote_files = any(
+                    c.get("kind") in ("write", "edit")
+                    for c in self.ctx.session.get("changes", [])
+                )
+                if wrote_files and not self._ran_command_this_run and self._finish_blocked < 2:
+                    self._finish_blocked += 1
+                    self.history.add_note(
+                        "你修改/创建了文件，但本次会话还没运行过任何命令来验证改动确实可工作"
+                        "（编译 / 测试 / 运行）。请先用 run_command 跑一遍验证，确认无误后再调用 finish 收尾；"
+                        "若确实无法运行验证（例如纯文本/数据文件），也请先自行检查输出是否符合要求。"
+                    )
+                    return None  # 不收尾，继续循环
                 self.ctx.session["finished"] = True
                 self.ctx.session["summary"] = summary
                 return "finish"

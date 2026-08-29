@@ -89,6 +89,9 @@ def test_text_protocol_channel():
                 {"name": "write_file", "arguments": {"path": "b.txt", "content": "line1\n"}},
                 {"name": "write_file", "arguments": {"path": "b.txt", "content": "line2\n", "append": True}},
             ]},
+            # V1 新行为：写完文件需先验证再 finish（这里用 type 确认内容确实写入）
+            {"content": "确认。", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "type b.txt"}}]},
             {"content": "完成。", "tool_calls": [{"name": "finish", "arguments": {"summary": "ok"}}]},
         ]
         backend, profile = _scripted(script, native=False)
@@ -493,6 +496,66 @@ def test_should_rotate_only_on_credential_errors():
     assert LLMBackend._should_rotate(LLMError("余额不足"))
     assert not LLMBackend._should_rotate(LLMError("upstream boom", status=500))
     assert not LLMBackend._should_rotate(LLMError("connection timeout"))
+
+
+# ----------------------------------------------------------------------------
+# V1：可靠性加固（中文乱码 / 交互式挂死 / 假完成拦截）
+# ----------------------------------------------------------------------------
+def test_run_command_decodes_chinese_without_garbage():
+    """Windows 中文环境默认 GBK：直接 utf-8 解码会把中文变乱码。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, _, registry, ctx = _make_env(tmp)
+        # 造一个 GBK（cp936）编码的文件，模拟 Windows 程序/老工具的中文输出
+        (Path(tmp) / "gbk.txt").write_bytes("中文测试输出".encode("gbk"))
+        r = registry.execute("run_command", {"command": "type gbk.txt"}, ctx)
+        assert r.ok, r.render()
+        out = r.output
+        assert "中文测试输出" in out
+        # 若误用 utf-8 解码 cp936 字节，会出现 ä¸­æ–‡ 之类乱码，断言不存在
+        assert "�" not in out
+        assert "ä¸­" not in out
+
+
+def test_interactive_command_is_killed_early():
+    """命令打印未换行的提示符后卡住（疑似等待输入）→ 提前终止而非挂到整体超时。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, _, registry, ctx = _make_env(tmp)
+        ctx.config.interactive_timeout = 1.2   # 测试里压短，避免真的等 20s
+        # 输出 "AWAIT_INPUT" 但不换行，然后 sleep(60)：模拟 REPL 等待输入。
+        # 注意：提示符不能用 '>'，否则 cmd.exe 会把 '>' 当作重定向吞掉输出。
+        cmd = "python -c \"import sys,time; sys.stdout.write('AWAIT_INPUT'); sys.stdout.flush(); time.sleep(60)\""
+        r = registry.execute("run_command", {"command": cmd}, ctx)
+        assert r.meta.get("interactive_killed") is True, r.render()
+        assert "AWAIT_INPUT" in r.render()
+        assert r.meta.get("timed_out") is False
+
+
+def test_fake_finish_blocked_until_verified():
+    """改了文件却没跑过命令就 finish → 被拦截逼它先验证，跑过命令后才允许收尾。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        script = [
+            {"content": "写文件", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "a.py", "content": "print(1)\n"}}]},
+            # ① 没验证就 finish → 应被拦截
+            {"content": "完成", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "done"}}]},
+            # ② 被逼着跑验证
+            {"content": "运行", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "python a.py"}}]},
+            # ③ 验证过之后 finish → 允许
+            {"content": "完成", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "done"}}]},
+        ]
+        backend, profile = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        result = loop.run("写个脚本")
+
+        assert result.finish_reason == "finish", result.finish_reason
+        # 拦截强制多跑了一轮（write + finish被拦 + run + finish），共 4 次工具调用
+        assert result.tool_calls == 4
+        joined = "\n".join(m.get("content", "") for m in loop.history.messages)
+        assert "验证" in joined   # 拦截提示确实被注入历史
 
 
 # ----------------------------------------------------------------------------

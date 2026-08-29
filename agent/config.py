@@ -90,6 +90,9 @@ class AgentConfig:
     max_parse_retries: int = 2
 
     command_timeout: int = 120
+    # 交互式挂死检测：命令长时间（默认 20s）零新输出、且缓冲区停在未换行的提示符上
+    # （如 REPL 的 `>>>`），判定为疑似等待输入，提前终止，避免挂到整体超时。
+    interactive_timeout: float = 20.0
     max_tool_output_chars: int = 12_000
     max_file_read_chars: int = 40_000
 

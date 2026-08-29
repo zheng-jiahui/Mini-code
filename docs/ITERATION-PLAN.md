@@ -30,7 +30,7 @@
 |---|---|---|
 | V0 | edit_block 精确编辑 | ✅ 已完成 |
 | V0.5 | 多密钥自动轮换 | ✅ 已完成 |
-| V1 | 可靠性加固 | ⬜ 待做 |
+| V1 | 可靠性加固 | ✅ 已完成 |
 | V2 | 自修复闭环 | ⬜ 待做 |
 | V3 | 上下文与成本治理 | ⬜ 待做 |
 | V6 | 交付打磨 | ⬜ 待做 |
@@ -83,25 +83,39 @@
 
 ---
 
-## V1 可靠性加固 ⬜ 待做
+## V1 可靠性加固 ✅
+
+**commit**：（见 git log：feat: V1 可靠性加固）
 
 **动机**：录演示视频最怕翻车，而这三类问题在 Windows 上是必现的。
 
 **改动清单**：
 1. **中文乱码**（`agent/tools/shell.py`）
-   现在用 `encoding="utf-8"` 解码子进程输出，但 Windows 中文环境默认 GBK。
-   实测 `dir index.html` 输出成 `������ D �еľ�û�б�ǩ��`。
-   改为：优先按系统编码（`locale.getpreferredencoding(False)`，通常 cp936）解码，
-   失败再回退 UTF-8；`errors` 用 `replace` 兜底。
-2. **交互式命令挂死**
-   命令等待 stdin 时（比如漏了 `-q` 的 pytest）会一直卡到超时。
-   加检测：短时间内无输出且进程未退出 → 判定为等待输入 → 提前返回明确错误。
-3. **"假完成"拦截**
-   模型没跑过任何验证命令就调 `finish` 时，回灌提示要求先验证再收尾。
-   位置：`agent/loop.py` 的 `_loop_body`，判断 `ctx.session["changes"]` 非空
-   但本次会话没有 `run_command` 记录。
+   旧实现用 `text=True, encoding="utf-8"` 直接解码，但 Windows 中文环境默认 GBK，
+   `dir`/`type`/老工具的中文会成 `������`。
+   改为字节流捕获 + 解码顺序：**UTF-8 严格 → 系统 OEM 代码页（cp936/GBK）→ UTF-8 替换兜底**。
+   关键修正：不能只用 `locale.getpreferredencoding()`——开启 UTF-8 beta 的机器上它返回 utf-8，
+   此时子进程若吐 GBK 字节仍会乱码，必须用 OEM 代码页（`ctypes.windll.kernel32.GetOEMCP()`）。
+2. **交互式命令挂死**（`agent/tools/shell.py`）
+   旧实现用 `BufferedReader.read(4096)`，它会**一直阻塞到凑满 4096 字节或 EOF**，
+   导致进程还活着时读不到已产生的部分输出，交互式检测因此永远不触发。
+   改用 `os.read(fd, 4096)`（返回当前可用字节），并增加检测：命令长时间（默认 20s）
+   零新输出、且缓冲区停在未换行的提示符上 → 判定疑似等待输入 → 提前终止并给明确错误。
+3. **"假完成"拦截**（`agent/loop.py` 的 `_execute_calls`）
+   模型改过文件（`write`/`edit` 类变更）却没跑过任何 `run_command` 就调 `finish` 时，
+   回灌提示逼它先验证（最多拦 2 次防死循环），跑过命令后才允许收尾。
 
-**验收**：Windows 下跑 `dir` 中文不乱码；`python` 进交互模式能被识别并报错而非挂死。
+**实测**：
+- 真实任务「写脚本打印中文问候并运行」→ 输出 `你好，世界！` 无乱码；3 步 5.9s 完成。
+- 单测 `test_run_command_decodes_chinese_without_garbage`：GBK 文件经 `type` 输出解码正确，无替换字符。
+- 单测 `test_interactive_command_is_killed_early`：打印未换行提示符后 sleep 的命令被 1.2s 内识别并终止。
+- 单测 `test_fake_finish_blocked_until_verified`：写完文件直接 finish 被拦截，跑过命令后才允许收尾。
+- 3 个新用例，共 **23** 个全通过。
+
+**答辩要点**：
+- 中文乱码根因是「解码编码假设错误」——不能假设子进程都是 UTF-8；OEM 代码页才是 Windows 非 Unicode 程序的真实输出编码。
+- 交互式挂死根因是「读取方式假设错误」——`BufferedReader.read(n)` 是「凑满 n 或 EOF」而非「读到即返回」，
+  流式输出必须用语义正确的 `os.read`。两个 bug 都说明：和操作系统/标准库打交道时，不能想当然。
 
 ---
 
@@ -182,3 +196,6 @@
 - 2026-08-29 23:50 — V0 edit_block 完成（commit 5121f47），18 个测试通过
 - 2026-08-29 00:20 — V0.5 多密钥轮换完成（commit 97fa08e），20 个测试通过；
   顺带修了 `_rebuild_client` 空实现这个致命缺陷
+- 2026-08-30 00:35 — V1 可靠性加固完成，23 个测试通过；
+  修了中文乱码（OEM 代码页解码）与交互式挂死（BufferedReader→os.read 阻塞）两个真实 bug，
+  新增"假完成"拦截

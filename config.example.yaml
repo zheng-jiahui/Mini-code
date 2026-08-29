@@ -50,6 +50,9 @@ agent:
   max_consecutive_errors: 4
   max_parse_retries: 2
   command_timeout: 120
+  # 交互式挂死检测：命令长时间（默认 20s）零新输出、且缓冲区停在未换行的提示符上，
+  # 判定为疑似等待输入，提前终止，避免把进程挂到整体超时。（见 agent/tools/shell.py）
+  interactive_timeout: 20.0
   max_tool_output_chars: 12000
   max_file_read_chars: 40000
   max_context_tokens: 96000
