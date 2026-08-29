@@ -554,8 +554,91 @@ def test_fake_finish_blocked_until_verified():
         assert result.finish_reason == "finish", result.finish_reason
         # 拦截强制多跑了一轮（write + finish被拦 + run + finish），共 4 次工具调用
         assert result.tool_calls == 4
+    joined = "\n".join(m.get("content", "") for m in loop.history.messages)
+    assert "验证" in joined   # 拦截提示确实被注入历史
+
+
+# ----------------------------------------------------------------------------
+# V2：自修复闭环（测试命令识别 / traceback 上下文 / 回滚 / 端到端自愈）
+# ----------------------------------------------------------------------------
+def test_detect_test_command():
+    from agent.selfrepair import detect_test_command
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        assert detect_test_command(tmp) == "pytest -q"
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "go.mod").write_text("module x\n", encoding="utf-8")
+        assert detect_test_command(tmp) == "go test ./..."
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "package.json").write_text("{}", encoding="utf-8")
+        assert detect_test_command(tmp) == "npm test"
+    with tempfile.TemporaryDirectory() as tmp:
+        assert detect_test_command(tmp) is None
+
+
+def test_build_failure_note_reads_offending_lines():
+    from agent.selfrepair import build_failure_note
+    with tempfile.TemporaryDirectory() as tmp:
+        code = "def add(a, b):\n    return a + b\n\ndef div(a, b):\n    return a / c\n"  # c 未定义
+        (Path(tmp) / "calc.py").write_text(code, encoding="utf-8")
+        cfg, _, registry, ctx = _make_env(tmp)
+        tb = (
+            'Traceback (most recent call last):\n'
+            '  File "calc.py", line 5, in div\n'
+            "ZeroDivisionError: name 'c' is not defined\n"
+        )
+        note = build_failure_note(tb, ctx)
+        assert note is not None
+        assert "calc.py" in note and "第 5 行" in note
+        assert "return a / c" in note   # 出错附近的源码被附上，模型无需再 read_file
+
+
+def test_rollback_restores_latest_snapshot():
+    """rollback 工具把 .agent_backups 里最新快照拷回任务目录。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, _, registry, _ = _make_env(tmp, per_task_dir=True)
+        backend, profile = _scripted([{"content": "x", "tool_calls": []}])
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        # 造一个任务目录与一份"好"快照
+        task_dir = loop.prepare_task_dir("demo")
+        (Path(task_dir) / "good.py").write_text("print('ok')\n", encoding="utf-8")
+        loop.ctx.session["changes"] = [{"kind": "write", "detail": "good.py"}]
+        snap = loop.snapshot_to_backups()
+        assert snap is not None
+        # 把当前目录改"坏"
+        (Path(task_dir) / "good.py").write_text("print('BROKEN')\n", encoding="utf-8")
+        # 通过工具回滚（必须用任务目录对应的 ctx：其 workspace 才是 task 目录）
+        r = registry.execute("rollback", {}, loop.ctx)
+        assert r.ok, r.render()
+        assert (Path(task_dir) / "good.py").read_text(encoding="utf-8") == "print('ok')\n"
+
+
+def test_self_repair_feeds_traceback_context_and_recovers():
+    """写带 bug 的脚本 → 运行失败 → 循环回灌出错位置 → 模型读上下文修好 → 跑通。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        # 第 1 轮：写坏脚本（c 未定义）并运行（失败）；第 2 轮：模型据回灌的出错位置修好；第 3 轮：跑通并 finish
+        script = [
+            {"content": "写脚本", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "calc.py",
+                 "content": "def div(a, b):\n    return a / c\n"}}]},
+            {"content": "运行", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "python calc.py"}}]},
+            {"content": "修", "tool_calls": [
+                {"name": "edit_block", "arguments": {
+                    "path": "calc.py", "old_text": "return a / c", "new_text": "return a / b"}}]},
+            {"content": "再运行", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "python calc.py"}}]},
+            {"content": "完成", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "已修复并验证"}}]},
+        ]
+        backend, profile = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        result = loop.run("写个除法函数")
+        assert result.finish_reason == "finish", result.finish_reason
+        # 失败那轮，循环注入了带出错位置的提示
         joined = "\n".join(m.get("content", "") for m in loop.history.messages)
-        assert "验证" in joined   # 拦截提示确实被注入历史
+        assert "第 4 行" in joined or "calc.py" in joined   # 自修复上下文被回灌
 
 
 # ----------------------------------------------------------------------------

@@ -179,6 +179,7 @@ class AgentLoop:
         self._consecutive_errors = 0
         self._ran_command_this_run = False   # 本任务是否已跑过 run_command（假完成拦截用）
         self._finish_blocked = 0             # finish 被"先验证"拦截的次数（最多 2 次，防死循环）
+        self._consecutive_run_failures = 0   # 连续 run_command 失败次数（自修复预算）
         self._usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     # ------------------------------------------------------------------
@@ -281,6 +282,7 @@ class AgentLoop:
             self.config, console=self.console, session=self.ctx.session if self.ctx else {}
         )
         self.ctx.session.setdefault("changes", [])
+        self.ctx.session["task_name"] = self._task_name   # 供 rollback 工具定位快照
 
         self.system_prompt = build_system_prompt(
             tool_list=self.registry.describe(),
@@ -316,6 +318,7 @@ class AgentLoop:
         self.ctx.session["changes"] = []
         self._ran_command_this_run = False
         self._finish_blocked = 0
+        self._consecutive_run_failures = 0
         self.ctx.session.pop("finished", None)
         self.ctx.session.pop("summary", None)
 
@@ -501,6 +504,14 @@ class AgentLoop:
 
             tool_result = self.registry.execute(call.name, call.arguments, self.ctx, call_id=call.id)
 
+            # 自修复闭环：run_command 失败时，把「出错位置 + 附近源码」直接回灌给模型，
+            # 省掉它多一轮 read_file；连续失败达到预算时提醒停止乱试、考虑回滚。
+            if call.name == "run_command":
+                if tool_result.ok:
+                    self._consecutive_run_failures = 0
+                else:
+                    self._on_command_failure(tool_result)
+
             # 回执写回历史：原生调用用 tool 角色，文本协议调用用 user 角色
             style = "native" if call.source == "native" else "text"
             rendered = tool_result.render(max_chars=int(self.config.max_tool_output_chars))
@@ -542,6 +553,31 @@ class AgentLoop:
                 self.console.error(result.answer)
         elif reason == "aborted":
             result.answer = "（操作被取消）"
+
+    def _on_command_failure(self, tool_result) -> None:
+        """run_command 失败后的自修复感知：回灌「出错位置 + 源码上下文」，并在预算耗尽时提醒回滚。"""
+        from .selfrepair import build_failure_note, detect_test_command
+
+        output = tool_result.output or tool_result.error or ""
+        note = build_failure_note(output, self.ctx)
+
+        # 没有 traceback，但可能是「没测到」——给出该项目的测试命令提示
+        if note is None and ("no tests ran" in output or "collected 0 items" in output):
+            cmd = detect_test_command(self.workspace_root)
+            if cmd:
+                note = f"没有收集到任何测试用例。该项目可用的测试命令是 `{cmd}`，请确认测试文件命名/位置后重试。"
+
+        if note:
+            self.history.add_note(note)
+
+        self._consecutive_run_failures += 1
+        budget = int(getattr(self.config, "max_repair_retries", 5))
+        if self._consecutive_run_failures >= budget:
+            self.history.add_note(
+                f"已连续 {self._consecutive_run_failures} 次运行失败。请停止无方向地乱试："
+                f"回顾最近一次错误的根因、定向修复；若仍无法修复，可调用 rollback 工具"
+                f"把代码恢复到上一次能跑通的快照，再从那时起重新分析。"
+            )
 
     # ------------------------------------------------------------------
     # 上下文与停滞检测

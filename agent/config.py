@@ -88,6 +88,8 @@ class AgentConfig:
     max_steps_without_progress: int = 8
     max_consecutive_errors: int = 4
     max_parse_retries: int = 2
+    # 自修复预算：同一任务连续运行失败达到此次数后，提醒模型停止乱试、考虑回滚
+    max_repair_retries: int = 5
 
     command_timeout: int = 120
     # 交互式挂死检测：命令长时间（默认 20s）零新输出、且缓冲区停在未换行的提示符上

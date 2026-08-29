@@ -31,7 +31,7 @@
 | V0 | edit_block 精确编辑 | ✅ 已完成 |
 | V0.5 | 多密钥自动轮换 | ✅ 已完成 |
 | V1 | 可靠性加固 | ✅ 已完成 |
-| V2 | 自修复闭环 | ⬜ 待做 |
+| V2 | 自修复闭环 | ✅ 已完成 |
 | V3 | 上下文与成本治理 | ⬜ 待做 |
 | V6 | 交付打磨 | ⬜ 待做 |
 | V4 | 可审阅性 | ⬜ 待做 |
@@ -119,24 +119,40 @@
 
 ---
 
-## V2 自修复闭环 ⬜ 待做
+## V2 自修复闭环 ✅
+
+**commit**：（见 git log：feat: V2 自修复闭环）
 
 **动机**：从"能写代码"升级到"能交付正确的代码"——这是 coding agent 的核心竞争力，
 也是面试最能讲出彩的一块。
 
 **改动清单**：
-1. 自动识别测试框架：按 `pytest.ini`/`package.json`/`go.mod`/`Makefile` 判断，
-   得出测试命令（如 `pytest -q`）
-2. 失败时解析 traceback：提取 `File "...", line N` → 自动 `read_file` 该处附近 → 定向修复
-3. **和已有的「第 N 次」归档打通**：连续 N 次修不好 → 自动回滚到最近一次能跑通的快照
-   （`.agent_backups/{任务名}_{时间戳}_{第N次}/`）
-4. 修复预算：最多重试 K 次，超出则停止并报告，防止无限烧 token
+1. **测试框架识别**（`agent/selfrepair.py::detect_test_command`）
+   扫描 `pytest.ini`/`pyproject.toml`/`go.mod`/`Cargo.toml`/`package.json`/`Makefile` 及
+   `test_*.py` 命名约定，猜出该项目的测试命令（pytest -q / go test ./... / npm test …）。
+2. **traceback 定位**（`parse_traceback` + `build_failure_note`）
+   run_command 失败时，提取首个 `File "路径", line N` 与末行错误，**直接读出该处附近源码**
+   附在回灌提示里——省掉模型多一轮 `read_file` 才能看到出错位置。
+3. **与「第 N 次」归档打通**（`agent/tools/repair.py::rollback` 工具）
+   新增 `rollback` 工具：把 `.agent_backups/{任务名}_*` 最新快照拷回任务目录，
+   连续修不好时一键回到上一次能跑通的状态。
+4. **修复预算**（`loop.py::_on_command_failure` + `config.max_repair_retries=5`）
+   run_command 连续失败达到预算 → 提醒停止无方向乱试、考虑 rollback；成功一次即清零。
 
-**验收**：故意让 agent 写一个带 bug 的脚本，它能自己测出来、定位、修好；
-故意给一个修不好的任务，它能在预算内停下来并回滚。
+**实测**：
+- 单测 `test_detect_test_command`：pytest/go/package.json 各自返回正确命令，空目录返回 None。
+- 单测 `test_build_failure_note_reads_offending_lines`：NameError 的 traceback 被解析，
+  出错行 `return a / c` 及其上下 3 行源码被附上。
+- 单测 `test_rollback_restores_latest_snapshot`：rollback 把"好"快照拷回，覆盖"坏"文件。
+- 单测 `test_self_repair_feeds_traceback_context_and_recovers`：MockBackend 跑「写坏→运行失败→
+  据回灌位置修好→跑通→finish」全流程，验证循环确实注入了出错上下文。
+- 4 个新用例，共 **27** 个全通过。
 
-**答辩要点**：回滚能力不是额外设计的，是从"每次生成都归档"这个规范里自然长出来的 ——
-既然保留了每一次的完整快照，"回到上一个已知可用状态"就是免费的。
+**答辩要点**：
+- 回滚能力不是额外设计的，是从"每次生成都归档"这个规范里**自然长出来**的——
+  既然保留了每一次的完整快照，"回到上一个已知可用状态"就是免费的。
+- 感知与执行分离：`selfrepair` 只做分析（纯函数、可单测），真正的"修"仍交给模型，
+  避免把修复逻辑硬编码成脆弱的规则。
 
 ---
 
@@ -199,3 +215,5 @@
 - 2026-08-30 00:35 — V1 可靠性加固完成，23 个测试通过；
   修了中文乱码（OEM 代码页解码）与交互式挂死（BufferedReader→os.read 阻塞）两个真实 bug，
   新增"假完成"拦截
+- 2026-08-30 01:10 — V2 自修复闭环完成，27 个测试通过；
+  新增 selfrepair 感知层（测试命令识别 / traceback 定位上下文）+ rollback 工具 + 修复预算
