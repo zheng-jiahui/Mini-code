@@ -26,7 +26,8 @@ profiles:
     native_tools: true
 
 agent:
-  workspace: "."
+  # 生成物统一放在 ./workspace（已 gitignore），不会污染项目根目录
+  workspace: "workspace"
   max_steps: 60
   max_steps_without_progress: 8
   max_consecutive_errors: 4
