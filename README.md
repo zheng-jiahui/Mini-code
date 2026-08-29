@@ -55,12 +55,17 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 │   ├── ui.py                 # 终端渲染（事件流、彩色、确认交互）
 │   ├── loop.py               # ★ 主循环：解析 → 执行 → 回灌 → 终止判定
 │   ├── cli.py                # 参数解析与 REPL 命令
+│   ├── profile.py            # 项目画像（语言/框架/测试命令）+ 工作区状态扫描
+│   ├── selfrepair.py         # 自修复感知层：测试命令识别、traceback 定位（纯函数）
 │   └── tools/
 │       ├── base.py           # ToolSpec / ToolRegistry / ToolResult（自建工具系统）
-│       ├── filesystem.py     # read_file / write_file / list_dir
+│       ├── filesystem.py     # read_file / write_file / edit_block / list_dir
 │       ├── shell.py          # run_command
 │       ├── search.py         # grep_search / find_files
-│       └── meta.py           # finish / ask_user
+│       ├── patch.py          # apply_patch（自实现 unified diff 应用器，不依赖外部 patch/git）
+│       ├── repair.py         # rollback（整目录 / 单文件级回退到历史快照）
+│       ├── review.py         # build_diff：本次会话改动的 unified diff
+│       └── meta.py           # finish / ask_user / plan
 ├── docs/DESIGN.md            # 完整设计说明（主循环流程图、接口定义、错误策略等）
 └── tests/                    # 冒烟测试（Mock 后端，无需 API key）
 ```
@@ -73,10 +78,12 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 |---|---|
 | 工具 | `read_file` `write_file` `list_dir` `run_command` `grep_search` `find_files` `finish` `ask_user` |
 | 双通道调用 | 优先原生 `tool_calls`；模型不支持时自动切到 ```json 文本协议 |
-| 上下文管理 | token 估算 → 工具输出 head/tail 截断 → 超阈值 LLM 摘要压缩 |
-| 循环控制 | 步数上限、token 预算、连续错误上限、重复调用指纹去重、用户 Ctrl-C 中断 |
-| 安全 | 工作区路径沙箱、危险命令拦截/二次确认、命令超时、写前自动备份 |
-| 可观测 | 每步打印「思考 / 工具调用 / 结果 / 耗时」，会话可存 JSONL 复盘 |
+| 上下文管理 | token 估算 → 工具回执智能压缩（信号行优先）→ 超阈值摘要压缩 → 硬截断兜底 |
+| 长程记忆 | **常驻事实层**：硬约束/技术选型/已失败方案常驻且不参与再压缩，避免"摘要的摘要"式衰减；压缩后重建工作区真实清单 |
+| 自修复 | 运行失败自动定位 traceback 并附上出错位置源码、测试命令自动识别、修复预算、一键回滚 |
+| 循环控制 | 步数上限、token 预算、连续错误上限、重复调用指纹去重、假完成拦截、用户 Ctrl-C 中断 |
+| 安全 | 工作区路径沙箱、危险命令拦截/二次确认、命令超时（带上限夹取）、写前自动备份 |
+| 可观测 | 每步打印「思考 / 工具调用 / 结果 / 耗时」，流式输出，`/diff` 审阅改动、`/stats` 成本与瓶颈面板，会话可存 JSONL 复盘 |
 
 ---
 
