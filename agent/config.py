@@ -112,7 +112,10 @@ class AgentConfig:
     command_policy: str = "confirm"      # allow | confirm | deny
     backup_on_write: bool = True
     backup_dir: str = ".agent_backups"
-    stream: bool = False
+    # 边生成边打印。此前一直是 False 且**没有任何代码读它**——又一个"声明了没实现"的字段。
+    # 默认改为 True：实测端点（NSCC MaaS / Qwen3.5）支持流式，且靠 stream_options 能带回
+    # usage，成本对账不受影响；网关不支持时后端会自动退回整包，不会变成可用性风险。
+    stream: bool = True
     session_log: Optional[str] = ".agent_sessions"
 
     # 每个任务在 workspace 下开一个独立子目录（<时间戳>-<任务摘要>），

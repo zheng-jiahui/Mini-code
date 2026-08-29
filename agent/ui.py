@@ -136,6 +136,46 @@ class Console:
         parts = [f"{k}={v}" for k, v in data.items()]
         self.echo(self._c("  " + " · ".join(parts), _Style.GREY))
 
+    # ---------------- 流式输出 ----------------
+    def stream_begin(self, label: str = "") -> None:
+        """准备一段流式输出。与 spinner 二选一——spinner 靠 `\\r` 覆盖同一行，
+        会和流式正文互相擦除，所以同一轮只能用其中一个。"""
+        self._streaming_label = label
+        self._streaming_any = False
+        self._streaming_started = False
+
+    def stream(self, text: str) -> None:
+        """写入一个增量分片（不换行，立即 flush——不然就不叫"边生成边看"了）。
+
+        标签延迟到第一片**非空白**内容时才打印：模型在"只吐工具调用"的轮次里
+        往往先发几个纯空白分片，一上来就打标签会让界面刷出一串空行。
+        """
+        if not text:
+            return
+        if not self._streaming_started:
+            if not text.strip():
+                return
+            if self._streaming_label:
+                sys.stdout.write(self._c(f"  {self._streaming_label} ▸ ", _Style.GREY))
+            self._streaming_started = True
+        self._streaming_any = True
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def stream_end(self) -> None:
+        """结束流式输出：补一个换行，避免后续回执和正文挤在同一行。
+
+        若这一轮一个字都没流出来（模型只给了工具调用），补一行提示——
+        否则界面上会毫无反馈，反而不如原来的 spinner。
+        """
+        if getattr(self, "_streaming_any", False):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        elif getattr(self, "_streaming_label", ""):
+            self.echo(self._c(f"  … {self._streaming_label}", _Style.GREY))
+        self._streaming_any = False
+        self._streaming_started = False
+
     # ---------------- 交互 ----------------
     def confirm(self, question: str, default: bool = False) -> bool:
         """向用户确认。非交互环境下返回 default。"""

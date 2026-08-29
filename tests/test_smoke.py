@@ -939,6 +939,155 @@ def test_record_change_marks_command_and_oversize_as_not_captured():
 
 
 # ----------------------------------------------------------------------------
+# 追加工作：流式输出（边生成边打印）
+# ----------------------------------------------------------------------------
+class _FakeFn:
+    def __init__(self, name=None, arguments=None):
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeDeltaCall:
+    def __init__(self, index, id_=None, name=None, arguments=None):
+        self.index = index
+        self.id = id_
+        self.function = _FakeFn(name, arguments)
+
+
+class _FakeChunk:
+    def __init__(self, content=None, tool_calls=None, finish_reason=None, usage=None):
+        self.usage = usage
+        if content is None and tool_calls is None and finish_reason is None:
+            self.choices = []
+        else:
+            self.choices = [type("C", (), {
+                "delta": type("D", (), {"content": content, "tool_calls": tool_calls})(),
+                "finish_reason": finish_reason,
+            })()]
+
+
+class _FakeStreamClient:
+    """按给定 chunk 序列模拟流式响应；stream_options 不支持时可让 create 抛错。"""
+
+    def __init__(self, chunks, reject_stream_options=False):
+        self._chunks = chunks
+        self._reject = reject_stream_options
+
+    # 真实 SDK 的调用链是 client.chat.completions.create(...)
+    @property
+    def chat(self):
+        return self
+
+    @property
+    def completions(self):
+        return self
+
+    def create(self, **kwargs):
+        if kwargs.get("stream"):
+            if self._reject and "stream_options" in kwargs:
+                raise RuntimeError("400 stream_options is not supported")
+            return iter(self._chunks)
+        raise AssertionError("本用例不应走整包路径")
+
+
+def _streaming_backend(chunks):
+    """造一个只跑 _send_streaming 的 OpenAIBackend（不需要真实网络客户端）。"""
+    from agent.llm import OpenAIBackend, LLMProfile
+    backend = OpenAIBackend.__new__(OpenAIBackend)
+    backend._client = _FakeStreamClient(chunks)
+    backend.profile = LLMProfile(native_tools=True, api_key="test", model="m")
+    return backend
+
+
+def test_streaming_accumulates_fragmented_tool_calls():
+    """流式下 tool_calls 是按 index 分片的，必须攒够再解析。
+
+    一个函数调用的 id / name / arguments 会跨多个 chunk 到达；直接拿单个 chunk 的
+    arguments 去 json.loads 必然是残缺 JSON —— 这正是流式实现最容易错的地方。
+    """
+    chunks = [
+        _FakeChunk(content="我先看看"),
+        _FakeChunk(content="文件。"),
+        # 第 0 个调用：id / name / arguments 分三片到达
+        _FakeChunk(tool_calls=[_FakeDeltaCall(0, id_="call_1")]),
+        _FakeChunk(tool_calls=[_FakeDeltaCall(0, name="read_file")]),
+        _FakeChunk(tool_calls=[_FakeDeltaCall(0, arguments='{"pa')]),
+        _FakeChunk(tool_calls=[_FakeDeltaCall(0, arguments='th": "a.py"}')]),
+        # 第 1 个调用：与第 0 个交错到达，且 index 顺序打乱
+        _FakeChunk(tool_calls=[_FakeDeltaCall(1, id_="call_2", name="grep_search",
+                                              arguments='{"pattern": "x"}')]),
+        _FakeChunk(finish_reason="tool_calls"),
+    ]
+
+    deltas = []
+    msg = _streaming_backend(chunks)._send_streaming({"model": "m"}, deltas.append)
+
+    assert "".join(deltas) == "我先看看文件。"
+    assert msg.content == "我先看看文件。"
+    assert msg.finish_reason == "tool_calls"
+    assert len(msg.tool_calls) == 2
+    # 分片累积后必须是完整可解析的 JSON，而不是空 dict + malformed
+    assert msg.tool_calls[0].name == "read_file"
+    assert msg.tool_calls[0].arguments == {"path": "a.py"}
+    assert msg.tool_calls[0].malformed is False, "分片 arguments 累积后应能正常解析"
+    assert msg.tool_calls[1].name == "grep_search"
+    assert msg.tool_calls[1].arguments == {"pattern": "x"}
+
+
+def test_streaming_keeps_usage_for_cost_accounting():
+    """流式默认不带 usage，而 /stats 的真实成本依赖它——必须显式要回来。
+
+    否则流式一开，成本对账就悄悄失效（不报错、只是数字变成 0）。
+    """
+    usage = type("U", (), {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120})()
+    # usage 通常只在最后一个（只含 usage 的）chunk 里出现
+    chunks = [_FakeChunk(content="hi"), _FakeChunk(usage=usage)]
+    msg = _streaming_backend(chunks)._send_streaming({"model": "m"}, lambda _t: None)
+    assert msg.usage == {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+    assert msg.content == "hi"
+
+
+def test_streaming_falls_back_when_gateway_rejects_it():
+    """网关不支持流式（或 stream_options）时，要退回整包而不是直接失败。
+
+    流式只是体验优化，不该成为可用性风险；更不能让它在演示时突然挂掉。
+    """
+    from agent.llm import OpenAIBackend, LLMProfile
+
+    class _BlockingOnlyClient:
+        """流式一律拒绝（模拟不支持 stream 的网关），只接受整包。"""
+
+        @property
+        def chat(self):
+            return self
+
+        @property
+        def completions(self):
+            return self
+
+        def create(self, **kwargs):
+            if kwargs.get("stream"):
+                raise RuntimeError("400 stream is not supported")
+            resp = type("R", (), {})()
+            choice = type("C", (), {})()
+            choice.message = type("M", (), {"content": "整包返回", "tool_calls": []})()
+            choice.finish_reason = "stop"
+            resp.choices = [choice]
+            resp.usage = type("U", (), {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7})()
+            return resp
+
+    backend = OpenAIBackend.__new__(OpenAIBackend)
+    backend._client = _BlockingOnlyClient()
+    backend.profile = LLMProfile(native_tools=True, api_key="test", model="m")
+
+    out = []
+    msg = backend._send([{"role": "user", "content": "hi"}], tools=None,
+                        tool_choice=None, on_delta=out.append)
+    assert msg.content == "整包返回", "流式被拒时应自动退回整包"
+    assert msg.usage["total_tokens"] == 7
+
+
+# ----------------------------------------------------------------------------
 # 追加工作：工具反向文档（when_not_to_use）
 # ----------------------------------------------------------------------------
 def test_every_tool_documents_when_not_to_use_it():

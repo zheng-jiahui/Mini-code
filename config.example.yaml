@@ -63,7 +63,7 @@ agent:
   restrict_to_workspace: true
   command_policy: confirm            # allow | confirm | deny
   backup_on_write: true
-  stream: false
+  stream: true                       # 边生成边打印；网关不支持流式时自动退回整包，不会失败
   session_log: ".agent_sessions"
 
 dangerous_commands: []               # 留空则使用 security.py 内置黑名单

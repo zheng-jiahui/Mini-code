@@ -417,7 +417,7 @@ class AgentLoop:
 
             # --- 2) 解析 ---
             outcome, attempts = self._parse_with_retry(msg)
-            if self.console:
+            if self.console and not self._narration_already_streamed(outcome.narration):
                 self.console.thinking(outcome.narration)
             self._emit("parsed", {"calls": [c.name for c in outcome.calls], "issues": outcome.issues})
 
@@ -457,12 +457,41 @@ class AgentLoop:
     # 各步骤实现
     # ------------------------------------------------------------------
     def _chat(self) -> AssistantMessage:
-        """调一次模型，带 UI 反馈。"""
+        """调一次模型，带 UI 反馈。
+
+        流式与 spinner 二选一：spinner 靠 `\\r` 覆盖同一行，会和流式正文互相擦除。
+        没有 console（如单测）或关掉流式时，仍走原来的整包路径。
+        """
         tools = self.registry.schemas() if self.native else None
-        if self.console:
-            with self.console.spinner(f"调用 {self.profile.model}"):
-                return self.backend.chat(self.history.payload(), tools=tools)
-        return self.backend.chat(self.history.payload(), tools=tools)
+        if not self.console:
+            return self.backend.chat(self.history.payload(), tools=tools)
+
+        if getattr(self.config, "stream", True):
+            self.console.stream_begin(self.profile.model)
+            # 记下本轮流式吐出的正文，供后面判断"思考"提示是否属于重复输出
+            self._streamed_text = ""
+
+            def _on_delta(chunk: str) -> None:
+                self._streamed_text += chunk
+                self.console.stream(chunk)
+
+            msg = self.backend.chat(self.history.payload(), tools=tools, on_delta=_on_delta)
+            self.console.stream_end()
+            return msg
+        self._streamed_text = ""
+
+        with self.console.spinner(f"调用 {self.profile.model}"):
+            return self.backend.chat(self.history.payload(), tools=tools)
+
+    def _narration_already_streamed(self, narration: Optional[str]) -> bool:
+        """本轮的正文是否已经通过流式逐字打印过。
+
+        流式把模型正文实时打给用户之后，下面那行「思考」提示就是同一段内容的重复——
+        只在内容确实被输出过时才抑制，避免误伤（比如解析纠错后 narration 是新文案）。
+        """
+        streamed = getattr(self, "_streamed_text", "") or ""
+        text = (narration or "").strip()
+        return bool(streamed) and bool(text) and text in streamed
 
     def _parse_with_retry(self, msg: AssistantMessage):
         """解析；解析不出调用时把问题回灌给模型让它自我修正。

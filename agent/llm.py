@@ -138,8 +138,14 @@ class LLMBackend(ABC):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
+        on_delta=None,
     ) -> AssistantMessage:
-        """真正发一次请求（由子类实现）。"""
+        """真正发一次请求（由子类实现）。
+
+        on_delta: 流式增量回调 (text_chunk: str) -> None。能流式的后端应在收到分片时
+        即时调用；不能流式的后端（如 Mock）可以忽略它——调用方仍会拿到完整结果，
+        所以"没有流式"只会退化成"一次性输出"，不会丢内容。
+        """
 
     def chat(
         self,
@@ -155,6 +161,8 @@ class LLMBackend(ABC):
             tools: 工具 schema 列表；为 None 时不传 tools 字段（文本协议模式）。
             tool_choice: "auto" / "none" / 指定函数。
             on_delta: 流式增量回调（可选），签名 (text_chunk: str) -> None。
+                流式期间会随收随调；若请求中途失败并重试，会先回调一条中断提示，
+                避免用户把两段拼起来误读成一次完整输出。
 
         Returns:
             AssistantMessage。
@@ -166,13 +174,19 @@ class LLMBackend(ABC):
         last_exc: Optional[BaseException] = None
         rotations = 0
         max_rotations = max(0, len(self._keys) - 1)
+        emitted = False        # 本次是否已经往回调里吐过内容
+
+        def _delta(text: str) -> None:
+            nonlocal emitted
+            if text:
+                emitted = True
+                if on_delta:
+                    on_delta(text)
 
         for attempt in range(retries + 1):
             try:
-                msg = self._send(messages, tools=tools, tool_choice=tool_choice)
-                if on_delta and msg.content:
-                    on_delta(msg.content)
-                return msg
+                return self._send(messages, tools=tools, tool_choice=tool_choice,
+                                  on_delta=_delta if on_delta else None)
             except LLMError as exc:
                 last_exc = exc
                 # 凭据/配额类错误：换一把钥匙再试，对同一把 key 重试没有意义
@@ -188,11 +202,67 @@ class LLMBackend(ABC):
                 llm_exc = LLMError(f"模型调用异常：{type(exc).__name__}: {exc}", retryable=True)
                 if attempt >= retries:
                     raise llm_exc from exc
+            # 已经吐过一半内容再重试，必须显式告知中断，否则用户会把两段拼成一次输出
+            if emitted:
+                _delta("\n[生成中断，正在重试]\n")
             # 指数退避 + 抖动，避免多个请求同时重试造成雪崩
             delay = (self.profile.retry_backoff ** attempt) + random.uniform(0, 0.4)
             time.sleep(min(delay, 30.0))
 
         raise LLMError(f"模型调用失败（已重试 {retries} 次）：{last_exc}")
+
+
+def _tool_calls_from_raw(raw_calls) -> List[ToolCall]:
+    """把 provider 形态的 tool_calls 解析成规范 ToolCall 列表。
+
+    流式与非流式共用：无论 arguments 是整包还是分片累积来的，都走同一段解析，
+    避免"两条通道各解析一遍、行为不一致"——那是本项目已经踩过的一类坑。
+    """
+    calls: List[ToolCall] = []
+    for tc in raw_calls or []:
+        raw_args = getattr(tc.function, "arguments", "") or "{}"
+        try:
+            args = json.loads(raw_args)
+            if not isinstance(args, dict):
+                raise ValueError("arguments 不是对象")
+            malformed = False
+        except Exception:  # noqa: BLE001 —— 参数不合法要如实回报给模型，不能抛给主循环
+            args, malformed = {}, True
+        calls.append(ToolCall(
+            id=getattr(tc, "id", "") or "",
+            name=getattr(tc.function, "name", "") or "",
+            arguments=args,
+            raw_arguments=raw_args,
+            malformed=malformed,
+        ))
+    return calls
+
+
+def _usage_from(resp: Any) -> Dict[str, int]:
+    """提取 usage；没有就返回空 dict（调用方按"未知"处理，不编造数字）。"""
+    usage = getattr(resp, "usage", None)
+    if not usage:
+        return {}
+    return {
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+    }
+
+
+class _SimpleCall:
+    """把流式累积出的 (id, name, arguments) 伪装成 provider 的 tool_call 对象，
+    好让流式与非流式共用 _tool_calls_from_raw 这一段解析。"""
+
+    def __init__(self, id_: str, name: str, arguments: str) -> None:
+        self.id = id_
+        self.function = _SimpleFn(name, arguments)
+
+
+class _SimpleFn:
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
 
 
 # ----------------------------------------------------------------------------
@@ -203,6 +273,8 @@ class OpenAIBackend(LLMBackend):
 
     def __init__(self, profile: LLMProfile):
         super().__init__(profile)
+        # 一旦确认该网关不支持流式就置 True，之后不再为每次调用白跑一次失败的流式请求
+        self._stream_disabled = False
         try:
             from openai import OpenAI  # 延迟导入，用 RawHTTPBackend 时不必安装
         except ImportError as exc:  # pragma: no cover
@@ -227,23 +299,52 @@ class OpenAIBackend(LLMBackend):
         """
         self._client = self._build_client()
 
-    def _send(self, messages, tools=None, tool_choice=None) -> AssistantMessage:
+    def _base_kwargs(self, messages, tools, tool_choice) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {
             "model": self.profile.model,
             "messages": messages,
             "temperature": self.profile.temperature,
             "top_p": self.profile.top_p,
             "max_tokens": self.profile.max_tokens,
-            "stream": False,
         }
         if tools and self.supports_native_tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
         if self.profile.extra_body:
             kwargs.update(self.profile.extra_body)
+        return kwargs
 
+    def _send(self, messages, tools=None, tool_choice=None, on_delta=None) -> AssistantMessage:
+        kwargs = self._base_kwargs(messages, tools, tool_choice)
+
+        # 流式只在「调用方确实要增量」时启用；否则走最稳的整包返回。
+        # 任何流式特有的失败都会自动退回整包，不会让用户卡住；
+        # 且退回过一次后记下，后续调用不再重复浪费一次失败请求。
+        if (on_delta and not getattr(self, "_stream_disabled", False)
+                and getattr(self.profile, "stream", True)):
+            try:
+                return self._send_streaming(kwargs, on_delta)
+            except LLMError as exc:
+                # 网关不支持流式（含 stream_options）时退回整包，而不是直接失败
+                if not self._looks_like_stream_unsupported(exc):
+                    raise
+                self._stream_disabled = True
+            except Exception:
+                self._stream_disabled = True
+
+        return self._send_blocking(kwargs)
+
+    @staticmethod
+    def _looks_like_stream_unsupported(exc: BaseException) -> bool:
+        """判断失败是否"像"网关不支持流式——是就退回整包，别让体验优化变成故障。"""
+        text = str(exc).lower()
+        markers = ("stream", "stream_options", "include_usage", "not support", "unsupported",
+                   "unknown", "invalid_request", "400")
+        return any(m in text for m in markers)
+
+    def _send_blocking(self, kwargs: Dict[str, Any]) -> AssistantMessage:
         try:
-            resp = self._client.chat.completions.create(**kwargs)
+            resp = self._client.chat.completions.create(stream=False, **kwargs)
         except Exception as exc:
             raise _translate_sdk_error(exc) from exc
 
@@ -252,31 +353,85 @@ class OpenAIBackend(LLMBackend):
             raise LLMError("模型返回空 choices", retryable=True)
 
         msg = choice.message
-        calls: List[ToolCall] = []
-        for tc in getattr(msg, "tool_calls", None) or []:
-            raw_args = tc.function.arguments or "{}"
-            try:
-                args = json.loads(raw_args)
-                if not isinstance(args, dict):
-                    raise ValueError("arguments 不是对象")
-                malformed = False
-            except Exception:
-                args, malformed = {}, True
-            calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args, raw_arguments=raw_args, malformed=malformed))
-
-        usage = {}
-        if getattr(resp, "usage", None):
-            usage = {
-                "prompt_tokens": getattr(resp.usage, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(resp.usage, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(resp.usage, "total_tokens", 0) or 0,
-            }
         return AssistantMessage(
             content=msg.content or "",
-            tool_calls=calls,
+            tool_calls=_tool_calls_from_raw(getattr(msg, "tool_calls", None)),
             finish_reason=getattr(choice, "finish_reason", "stop") or "stop",
-            usage=usage,
+            usage=_usage_from(resp),
             raw=resp,
+        )
+
+    def _send_streaming(self, kwargs: Dict[str, Any], on_delta) -> AssistantMessage:
+        """流式请求：边收边吐内容，同时把 tool_calls 的分片按 index 攒起来。
+
+        两个必须处理对的点：
+        1. **tool_calls 是按 index 分片的**。一个函数调用的 id / name / arguments 会
+           跨多个 chunk 到达，必须按 index 累积后再解析，否则 arguments 是残缺 JSON。
+        2. **默认流式不带 usage**，而 /stats 的成本对账依赖 API 返回的 usage。
+           所以要显式要 `stream_options={"include_usage": True}`；网关不支持时
+           由 _send 退回整包（宁可不流式，也不能让成本统计悄悄失效）。
+        """
+        try:
+            stream = self._client.chat.completions.create(
+                stream=True, stream_options={"include_usage": True}, **kwargs
+            )
+        except Exception as exc:
+            # 部分网关不接受 stream_options，去掉再试一次
+            translated = _translate_sdk_error(exc)
+            if not self._looks_like_stream_unsupported(translated):
+                raise translated from exc
+            try:
+                stream = self._client.chat.completions.create(stream=True, **kwargs)
+            except Exception as exc2:
+                raise _translate_sdk_error(exc2) from exc2
+
+        content_parts: List[str] = []
+        acc: Dict[int, Dict[str, str]] = {}
+        finish_reason = "stop"
+        usage: Dict[str, int] = {}
+        last_chunk: Any = None
+
+        for chunk in stream:
+            last_chunk = chunk
+            if getattr(chunk, "usage", None):
+                got = _usage_from(chunk)
+                if got:
+                    usage = got
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            choice = choices[0]
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            if getattr(delta, "content", None):
+                content_parts.append(delta.content)
+                on_delta(delta.content)
+            for tc in getattr(delta, "tool_calls", None) or []:
+                # index 缺失的网关（不规范但存在）一律归到 0，避免 KeyError 丢调用
+                idx = getattr(tc, "index", None)
+                idx = int(idx) if idx is not None else 0
+                slot = acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+                if getattr(tc, "id", None):
+                    slot["id"] += tc.id
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["name"] += fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["args"] += fn.arguments
+
+        calls = _tool_calls_from_raw([
+            _SimpleCall(slot["id"], slot["name"], slot["args"]) for _, slot in sorted(acc.items())
+        ])
+        return AssistantMessage(
+            content="".join(content_parts),
+            tool_calls=calls,
+            finish_reason=finish_reason or "stop",
+            usage=usage,
+            raw=last_chunk,
         )
 
 
@@ -306,7 +461,9 @@ class RawHTTPBackend(LLMBackend):
             self._session = requests.Session()
         return self._session
 
-    def _send(self, messages, tools=None, tool_choice=None) -> AssistantMessage:
+    def _send(self, messages, tools=None, tool_choice=None, on_delta=None) -> AssistantMessage:
+        # 本后端刻意保持"能看清协议"的极简实现，不做流式（SSE 解析会掩盖协议本身）；
+        # 忽略 on_delta 是安全的：调用方仍会拿到完整的 AssistantMessage。
         import requests
 
         payload: Dict[str, Any] = {
@@ -422,7 +579,7 @@ class MockBackend(LLMBackend):
         self.cursor = 0
         self.recorded: List[Dict[str, Any]] = []
 
-    def _send(self, messages, tools=None, tool_choice=None) -> AssistantMessage:
+    def _send(self, messages, tools=None, tool_choice=None, on_delta=None) -> AssistantMessage:
         self.recorded.append({"messages": messages, "tools": tools})
         if self.cursor >= len(self.script):
             return AssistantMessage(content="FINAL: 演示脚本执行完毕。", finish_reason="stop")
