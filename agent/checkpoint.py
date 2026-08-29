@@ -122,6 +122,10 @@ def save(loop, *, path: Optional[Path] = None) -> Optional[Path]:
         "output_compressions": loop._output_compressions,
         "model_time": loop._model_time,
         "model_calls": loop._model_calls,
+        # V9 质量指标。这是**追加**字段，因此不提升 CHECKPOINT_VERSION：
+        # 老检查点缺这个键 → 恢复为空列表（不影响历史），新检查点被老代码读 →
+        # 多出的键被忽略。两个方向都安全，没必要为此作废用户已有的检查点。
+        "metrics": getattr(loop, "metrics", None) and loop.metrics.to_dict(),
     }
 
     dest = Path(path) if path else _path_for(loop, loop.task_name)
@@ -201,6 +205,11 @@ def apply(loop, state: Dict[str, Any]) -> int:
     loop._output_compressions = int(state.get("output_compressions") or 0)
     loop._model_time = float(state.get("model_time") or 0.0)
     loop._model_calls = int(state.get("model_calls") or 0)
+
+    # 质量指标同样要跨进程连续：否则恢复会话后成功率只统计恢复之后的任务，
+    # 一次长任务被分成两段跑，成功率就会被算成两次独立会话，口径失真。
+    if hasattr(loop, "metrics"):
+        loop.metrics.restore(state.get("metrics"))
 
     n_msgs = len(state["messages"])
     loop.history.add_note(RESUME_NOTE.format(

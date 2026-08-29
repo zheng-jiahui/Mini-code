@@ -65,6 +65,7 @@ from .config import AgentConfig
 from .errors import Aborted, BudgetExceeded, LLMError
 from .history import History
 from .llm import AssistantMessage, LLMBackend, ToolCall
+from .metrics import SessionMetrics
 from .parser import ToolCallParser
 from .prompts import BUDGET_WARNING, NO_PROGRESS_HINT, build_system_prompt, build_task_message
 from .profile import (WORKSPACE_STATE_MARKER, detect_project_profile, format_project_profile,
@@ -200,6 +201,10 @@ class AgentLoop:
         self._session_started = time.time()
         self._model_time = 0.0            # 累计「等模型」的时间（通常是最大的一块）
         self._model_calls = 0
+
+        # V9 质量指标：成本面板回答"花了多少"，这里回答"做对了没有"。
+        # 二者缺一不可——只有成本没有质量，就判断不了一次改动是改进还是退步。
+        self.metrics = SessionMetrics()
 
     # ------------------------------------------------------------------
     # 任务级工作区
@@ -337,6 +342,8 @@ class AgentLoop:
         started = time.time()
         result = RunResult()
         self.last_task = task
+        # 质量指标：在任务开始前打点（token 记的是会话累计量，结算时取增量）
+        self.metrics.start_task(task, self._usage)
         # 每个任务一个独立子目录：首次进入时创建，同会话后续追问沿用
         result.task_dir = str(self.prepare_task_dir(task))
         # 每个任务清零"本次会话的副作用"与假完成拦截计数，保证语义是"本任务"而非跨任务累积
@@ -384,6 +391,17 @@ class AgentLoop:
             result.changes = list(self.ctx.session.get("changes", []))
             result.usage = dict(self._usage)
             result.compacted = self.history.compact_count
+            # 质量指标结算同样放在 finally：被中断、报错的任务恰恰是最该被
+            # 计入指标的（只统计正常结束的任务会让成功率虚高）。
+            self.metrics.finish_task(
+                result.finish_reason,
+                steps=result.steps,
+                tool_calls=result.tool_calls,
+                tool_errors=result.errors,
+                compacted=result.compacted,
+                usage=self._usage,
+                changes=result.changes,
+            )
             self._save_session(result)
             # 检查点写在 finally 里：Ctrl-C 中断、模型报错、预算耗尽都会走到这里，
             # 而恰恰是这些非正常结束的场景才最需要"下次接着跑"。
@@ -591,6 +609,9 @@ class AgentLoop:
             # 自修复闭环：run_command 失败时，把「出错位置 + 附近源码」直接回灌给模型，
             # 省掉它多一轮 read_file；连续失败达到预算时提醒停止乱试、考虑回滚。
             if call.name == "run_command":
+                # 质量指标：run_command 是 agent 唯一的"验证手段"，它的成败序列
+                # 就是自修复能力的原始素材（怎么切分回合见 metrics._repair_stats）。
+                self.metrics.record_verify(tool_result.ok)
                 if tool_result.ok:
                     self._consecutive_run_failures = 0
                 else:
@@ -864,6 +885,12 @@ class AgentLoop:
                 lines.append(f"    {name:<14} {t:7.2f}s  {pct:5.1f}%  ({n} 次)")
         else:
             lines.append("  各工具耗时占比：本次会话尚未调用任何工具")
+
+        # 质量指标：成本面板回答"花了多少"，这一段回答"做对了没有"。
+        # 两个视角必须放在一起——只看成本会得出"越快越好"的错误结论，
+        # 而一个频繁返工、最后没跑通的快任务，并不比慢一点但一次做对的任务更好。
+        lines.append("")
+        lines.extend(self.metrics.render_panel("  【质量指标】").splitlines())
         return "\n".join(lines)
 
     # ------------------------------------------------------------------

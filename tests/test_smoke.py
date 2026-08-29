@@ -684,19 +684,27 @@ def test_rollback_restores_latest_snapshot():
 
 
 def test_self_repair_feeds_traceback_context_and_recovers():
-    """写带 bug 的脚本 → 运行失败 → 循环回灌出错位置 → 模型读上下文修好 → 跑通。"""
+    """写带 bug 的脚本 → 运行失败 → 循环回灌出错位置 → 模型读上下文修好 → 跑通。
+
+    ⚠️ 本用例曾长期是**假通过**：原脚本只定义了函数、从未调用它，
+    `python calc.py` 退出码是 0，根本没触发失败；而断言写成
+    "第 4 行" in joined or "calc.py" in joined，后者在任何回显里都会命中。
+    结果是 V2 的招牌能力（自修复闭环）**没有任何测试真正覆盖过它**。
+    修法：脚本必须真的在运行时报错（这里用 div(4, 0) 触发 ZeroDivisionError），
+    断言则改为检查自修复提示真正交付的东西——出错行号 + 附近源码片段。
+    """
     with tempfile.TemporaryDirectory() as tmp:
         cfg, profile, registry, _ = _make_env(tmp)
-        # 第 1 轮：写坏脚本（c 未定义）并运行（失败）；第 2 轮：模型据回灌的出错位置修好；第 3 轮：跑通并 finish
+        # 第 1 轮：写会真的报错的脚本并运行（失败）；第 2 轮：据回灌的出错位置修好；第 3 轮：跑通并 finish
         script = [
             {"content": "写脚本", "tool_calls": [
                 {"name": "write_file", "arguments": {"path": "calc.py",
-                 "content": "def div(a, b):\n    return a / c\n"}}]},
+                 "content": "def div(a, b):\n    return a / b\n\n\nprint(div(4, 0))\n"}}]},
             {"content": "运行", "tool_calls": [
                 {"name": "run_command", "arguments": {"command": "python calc.py"}}]},
             {"content": "修", "tool_calls": [
                 {"name": "edit_block", "arguments": {
-                    "path": "calc.py", "old_text": "return a / c", "new_text": "return a / b"}}]},
+                    "path": "calc.py", "old_text": "print(div(4, 0))", "new_text": "print(div(4, 2))"}}]},
             {"content": "再运行", "tool_calls": [
                 {"name": "run_command", "arguments": {"command": "python calc.py"}}]},
             {"content": "完成", "tool_calls": [
@@ -706,9 +714,14 @@ def test_self_repair_feeds_traceback_context_and_recovers():
         loop = AgentLoop(cfg, profile, backend, registry, console=None)
         result = loop.run("写个除法函数")
         assert result.finish_reason == "finish", result.finish_reason
-        # 失败那轮，循环注入了带出错位置的提示
-        joined = "\n".join(m.get("content", "") for m in loop.history.messages)
-        assert "第 4 行" in joined or "calc.py" in joined   # 自修复上下文被回灌
+        assert result.errors == 1, f"第一次运行必须真的失败，实际 errors={result.errors}"
+
+        joined = "\n".join(str(m.get("content", "")) for m in loop.history.messages)
+        assert "运行失败" in joined, "失败后应回灌自修复提示"
+        assert "calc.py" in joined and "第 5 行" in joined, "提示里应给出出错的文件与行号"
+        # 核心价值：把出错处附近的源码直接给模型，省掉一轮 read_file
+        assert "该处附近的源码" in joined, "应附带出错位置附近的源码片段"
+        assert "print(div(4, 0))" in joined, "源码片段里应包含真正出错的那一行"
 
 
 # ----------------------------------------------------------------------------
@@ -1817,6 +1830,145 @@ def test_checkpoint_file_is_valid_json_with_no_temp_leftover():
         assert state["version"] == 1
         assert isinstance(state["messages"], list)
 
+
+
+# ----------------------------------------------------------------------------
+# V9：质量指标（回答"做对了没有"，而不只是"花了多少"）
+# ----------------------------------------------------------------------------
+def test_repair_stats_cut_failures_into_episodes():
+    """自修复按"回合"计：一段连续失败 + 紧随的成功 = 一回合，轮数=连续失败的长度。
+
+    失败 3 次才修好和失败 1 次就修好是两种能力水平，只看"失败总数"区分不了。
+    序列 F,F,S,F,S → 2 回合 / 共 3 轮；末尾若在失败则记为"未修复"，不计入平均值。
+    """
+    from agent.metrics import SessionMetrics
+    m = SessionMetrics()
+    for ok in [False, False, True, False, True]:
+        m.record_verify(ok)
+    assert m._repair_stats() == (2, 3, 0)
+
+    m2 = SessionMetrics()
+    for ok in [False, False]:          # 一直在失败，从没修回来
+        m2.record_verify(ok)
+    assert m2._repair_stats() == (0, 0, 2)
+
+    m3 = SessionMetrics()
+    for ok in [True, False, True]:     # 第一次就成功，不算"修复回合"
+        m3.record_verify(ok)
+    assert m3._repair_stats() == (1, 1, 0)
+
+
+def test_avg_repair_rounds_is_none_not_zero_when_never_repaired():
+    """从没成功修复过 → None 而不是 0。0 会被读成"一次就修好"，与事实相反。"""
+    from agent.metrics import TaskRecord
+    assert TaskRecord(finish_reason="finish").avg_repair_rounds is None
+    r = TaskRecord(finish_reason="finish", repair_rounds=2, repair_attempts=6)
+    assert r.avg_repair_rounds == 3.0
+
+
+def test_rework_counts_files_written_more_than_once():
+    """返工 = 同一路径被写入多次；命令类改动没有 path，不该被算进来。"""
+    from agent.metrics import SessionMetrics
+    m = SessionMetrics()
+    m.start_task("t")
+    rec = m.finish_task("finish", changes=[
+        {"kind": "write", "path": "a.py"},
+        {"kind": "edit", "path": "a.py"},     # 同一个文件改了两次 → 返工
+        {"kind": "write", "path": "b.py"},
+        {"kind": "command", "detail": "python a.py"},   # 无 path，排除
+    ])
+    assert rec.files_changed == 2
+    assert rec.rework_files == 1
+
+
+def test_quality_metrics_record_a_repair_round_end_to_end():
+    """端到端：跑失败 → 修好 → 跑通，应记为 1 个修复回合、1 轮。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        script = [
+            {"content": "写脚本", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "calc.py",
+                 "content": "def div(a, b):\n    return a / b\n\n\nprint(div(4, 0))\n"}}]},
+            {"content": "运行", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "python calc.py"}}]},
+            {"content": "修", "tool_calls": [
+                {"name": "edit_block", "arguments": {
+                    "path": "calc.py", "old_text": "print(div(4, 0))", "new_text": "print(div(4, 2))"}}]},
+            {"content": "再运行", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "python calc.py"}}]},
+            {"content": "完成", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "已修复并验证"}}]},
+        ]
+        backend, profile = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        result = loop.run("写个除法函数")
+        assert result.finish_reason == "finish", result.finish_reason
+        assert result.errors == 1, f"第一次运行必须真的失败，实际 errors={result.errors}"
+
+        rec = loop.metrics.tasks[-1]
+        assert rec.verify_runs == 2, rec.verify_runs
+        assert rec.verify_failures == 1
+        assert rec.repair_rounds == 1, "失败→成功应记为一个修复回合"
+        assert rec.repair_attempts == 1
+        assert rec.unresolved_failures == 0
+        assert rec.succeeded is True
+        assert rec.avg_repair_rounds == 1.0
+
+
+def test_quality_panel_reports_success_rate_and_outcomes():
+    """质量面板必须给出成功率与结局分布——光有 token/耗时答不出"做对了没有"。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        script = [{"content": "完成", "tool_calls": [
+            {"name": "finish", "arguments": {"summary": "ok"}}]}]
+        backend, profile = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        loop.run("最小任务")
+
+        panel = loop.build_stats_panel()
+        assert "质量指标" in panel, "成本面板里应包含质量段"
+        assert "任务数：1" in panel
+        assert "100.0%" in panel
+        assert "结局分布" in panel
+        # 结局要给"人话"解释，不能只丢一个枚举名让人猜
+        assert "显式完成" in panel
+
+
+def test_failure_outcomes_lower_the_success_rate():
+    """非成功结局必须拉低成功率：只统计"跑得漂亮"的任务会让指标自我美化。"""
+    from agent.metrics import SessionMetrics
+    m = SessionMetrics()
+    m.start_task("任务A")
+    m.finish_task("finish")
+    m.start_task("任务B")
+    m.finish_task("too_many_errors")
+    assert m.task_count == 2
+    assert m.success_count == 1
+    assert abs(m.success_rate - 0.5) < 1e-9
+    assert m.outcome_counts() == {"finish": 1, "too_many_errors": 1}
+    panel = m.render_panel()
+    assert "连续失败过多 1" in panel, "结局要翻译成人话，不能只丢枚举名"
+    # model_final 在成功之列，但置信度低于 finish（后者通过了假完成拦截）——
+    # 面板里两者分开列出，不混为一谈
+    from agent.metrics import SUCCESS_REASONS
+    assert "model_final" in SUCCESS_REASONS and "max_steps" not in SUCCESS_REASONS
+    m.start_task("任务C")
+    m.finish_task("model_final")
+    assert "未调用 finish" in m.render_panel()
+
+
+def test_metrics_survive_checkpoint_roundtrip():
+    """指标口径要跨进程连续：恢复会话后成功率不该只统计恢复之后的任务。"""
+    script = [{"content": "完成", "tool_calls": [
+        {"name": "finish", "arguments": {"summary": "ok"}}]}]
+    with tempfile.TemporaryDirectory() as tmp:
+        _, loop2, path = _run_then_new_loop(tmp, script, task="最小任务")
+        saved = json.loads(Path(path).read_text(encoding="utf-8"))
+        assert saved.get("metrics"), "检查点应带上质量指标"
+        n = loop2.resume_checkpoint(path)
+        assert n >= 1
+        assert loop2.metrics.task_count == 1, "恢复后应拿回之前的任务记录"
+        assert loop2.metrics.success_rate == 1.0
 
 
 # ----------------------------------------------------------------------------
