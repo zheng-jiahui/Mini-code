@@ -101,6 +101,20 @@ class AgentConfig:
     stream: bool = False
     session_log: Optional[str] = ".agent_sessions"
 
+    # 每个任务在 workspace 下开一个独立子目录（<时间戳>-<任务摘要>），
+    # 该任务的代码、.agent_backups 备份、.agent_sessions 日志都归拢在里面。
+    # 设为 False 则所有任务共用一个工作区（旧行为，便于脚本化与测试）。
+    per_task_dir: bool = True
+
+    # 工作区根目录（"所有生成代码的家"）。任务子目录建在它下面。
+    # 运行时 config.workspace 会被切成具体任务目录，本字段始终保持为根，
+    # 避免多个 AgentLoop 共享同一个 config 时把根目录记错。
+    workspace_root: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not self.workspace_root:
+            self.workspace_root = self.workspace
+
     dangerous_commands: List[str] = field(default_factory=list)
 
     def resolved_workspace(self) -> Path:
@@ -401,6 +415,10 @@ def load_config(
         elif key in AgentConfig.__annotations__:
             setattr(agent, key, value)
         # 未知 key 静默忽略，避免 CLI 传多余字段时崩溃
+
+    # workspace 经环境变量/命令行覆盖后定稿，此时才固定"工作区根目录"。
+    # 之后切任务子目录只会改 agent.workspace，不会动 workspace_root。
+    agent.workspace_root = agent.workspace
 
     # ---- 6) 默认值补齐与校验 ----
     if not agent.dangerous_commands:

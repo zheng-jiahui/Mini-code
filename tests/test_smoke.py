@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -36,7 +37,10 @@ from agent.tools.base import ToolResult  # noqa: E402
 # 辅助
 # ----------------------------------------------------------------------------
 def _make_env(tmpdir: str, native: bool = True, **agent_overrides):
-    cfg = AgentConfig(workspace=tmpdir, session_log=None, **agent_overrides)
+    # 端到端用例期望产物直接落在 tmp 里，所以默认关闭任务子目录
+    opts = {"per_task_dir": False}
+    opts.update(agent_overrides)
+    cfg = AgentConfig(workspace=tmpdir, session_log=None, **opts)
     profile = LLMProfile(native_tools=native, api_key="test", model="mock")
     registry = build_default_registry()
     ctx = build_tool_context(cfg, console=None, session={})
@@ -237,6 +241,57 @@ def test_config_env_placeholder_expansion(tmp_path=None):
     assert cfg.llm.model == "unit-test-model"
     assert "***" in cfg.llm.masked()["api_key"] and "unit-test" not in cfg.llm.masked()["api_key"]
     cfg_file.unlink(missing_ok=True)
+
+
+# ----------------------------------------------------------------------------
+# 11) 任务级子目录
+# ----------------------------------------------------------------------------
+def test_per_task_dir_isolates_each_task():
+    """开启 per_task_dir 后：每个任务独占一个子目录，代码与备份都归拢在里面。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp, per_task_dir=True, backup_on_write=True)
+        script = [
+            {"content": "写文件。", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "a.py", "content": "print('hi')\n"}}]},
+            {"content": "覆盖写一次，用于触发备份。", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "a.py", "content": "print('hi2')\n"}}]},
+            {"content": "完成。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "done"}}]},
+        ]
+        backend = MockBackend(profile, script)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+
+        result = loop.run("写一个快排脚本")
+        assert result.succeeded, result.error_message
+
+        # 产物不在工作区根目录，而在唯一的任务子目录里
+        entries = list(Path(tmp).iterdir())
+        assert len(entries) == 1, f"工作区根目录应只有 1 个任务子目录，实际：{entries}"
+        task_dir = entries[0]
+        assert task_dir.is_dir()
+        assert re.match(r"^\d{8}-\d{6}", task_dir.name), f"子目录名应带时间戳前缀：{task_dir.name}"
+        assert "快排" in task_dir.name, f"子目录名应含任务摘要：{task_dir.name}"
+
+        # 代码与备份都归拢在该任务目录内
+        assert (task_dir / "a.py").exists(), "代码应落在任务子目录里"
+        assert (task_dir / "a.py").read_text(encoding="utf-8") == "print('hi2')\n"
+        backup_root = task_dir / ".agent_backups"
+        assert backup_root.exists(), "备份目录应跟着任务走，而不是散在全局"
+        assert any(backup_root.rglob("*.py")), "覆盖写应产生备份文件"
+
+        # 同一会话内追问：沿用同一目录（否则模型看不到上一轮刚生成的文件）
+        backend2 = MockBackend(profile, [
+            {"content": "完成。", "tool_calls": [{"name": "finish", "arguments": {"summary": "ok"}}]}])
+        followup = AgentLoop(cfg, profile, backend2, registry, console=None)
+        followup._task_dir = task_dir                 # 模拟同一会话继续
+        followup.run("改成降序输出")
+        assert followup.task_dir == task_dir, "同会话追问应沿用同一任务目录"
+
+        # /new 开启新目录：新目录仍在工作区根下（不套娃），旧任务文件不受影响
+        newer = followup.prepare_task_dir("另一个任务", force_new=True)
+        assert newer != task_dir, "/new 应创建新目录"
+        assert newer.parent == Path(tmp), "新目录应直接建在工作区根下，而不是套在旧任务里"
+        assert (task_dir / "a.py").exists(), "旧任务目录里的文件不应被动过"
 
 
 # ----------------------------------------------------------------------------

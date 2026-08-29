@@ -36,6 +36,8 @@ BANNER_HELP = """\
   /stats             显示本次会话的统计信息
   /compact           手动压缩上下文
   /undo              撤销最近一次文件写入（从 .agent_backups 恢复）
+  /new [名字]        开启新的任务目录，后续代码放进新文件夹
+  /dir               显示当前任务目录
   /save [路径]       把当前对话导出为 JSONL
   !<命令>            直接执行 shell 命令（不经过模型）
 其余内容作为自然语言任务发送给智能体。
@@ -161,6 +163,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ---- 单次任务 ----
     if args.task:
+        # 先建好目录再跑，用户等待时就知道产物会落在哪
+        console.info(f"任务目录：{loop.prepare_task_dir(args.task)}")
         result = loop.run(args.task)
         console.final(result.answer)
         console.stats({"步数": result.steps, "工具调用": result.tool_calls,
@@ -219,6 +223,14 @@ def _repl(loop: AgentLoop, console: Console) -> int:
                     console.info("无需压缩（历史较短）。")
             elif cmd == "/undo":
                 console.echo(_undo(loop.console, loop.config))
+            elif cmd == "/new":
+                parts = raw.split(maxsplit=1)
+                hint = parts[1] if len(parts) > 1 else "新任务"
+                d = loop.prepare_task_dir(hint, force_new=True)
+                console.info(f"已开启新的任务目录：{d}")
+            elif cmd == "/dir":
+                d = loop.task_dir
+                console.info(f"当前任务目录：{d if d else '（尚未开始任务）'}")
             elif cmd == "/save":
                 parts = raw.split(maxsplit=1)
                 path = parts[1] if len(parts) > 1 else "session.jsonl"
@@ -239,11 +251,15 @@ def _repl(loop: AgentLoop, console: Console) -> int:
             continue
 
         # ---- 正常任务 ----
+        prev_dir = loop.task_dir
         try:
             result = loop.run(raw)
         except AgentError as exc:
             console.error(str(exc))
             continue
+        # 只在新建目录时提示，追问沿用同一目录时不打扰
+        if loop.task_dir != prev_dir:
+            console.info(f"任务目录：{loop.task_dir}")
         console.final(result.answer)
         console.echo(console._c("  " + result.stats_line(), "\033[90m") if console.color else "  " + result.stats_line())
 

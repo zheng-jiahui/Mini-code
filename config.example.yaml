@@ -28,6 +28,11 @@ profiles:
 agent:
   # 生成物统一放在 ./workspace（已 gitignore），不会污染项目根目录
   workspace: "workspace"
+  # 每个任务再开一个独立子目录 <时间戳>-<任务摘要>，例如
+  # workspace/20260829-214155-写一个词频统计脚本-word_count/
+  # 该任务的代码、.agent_backups 备份、.agent_sessions 日志都归拢在里面。
+  # 设为 false 则所有任务共用一个工作区。
+  per_task_dir: true
   max_steps: 60
   max_steps_without_progress: 8
   max_consecutive_errors: 4

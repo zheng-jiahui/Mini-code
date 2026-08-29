@@ -52,6 +52,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -76,6 +77,28 @@ _EMPTY_OUTPUT_HINT = (
 )
 
 
+def _slugify(text: str, max_chars: int = 20) -> str:
+    """把任务描述压成可作目录名的短标识。
+
+    保留中文与英文单词，但剔除三类噪音：路径非法字符、源码扩展名（.py 之类）、
+    中英文标点。否则任务里提到的 "xxx.py" 会把目录名搞成 "…-bubble_sort.py，可"。
+    """
+    s = (text or "").strip()
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", s)
+    s = re.sub(r"\.(py|js|jsx|ts|tsx|java|cpp|c|h|go|rs|html|css|md|json|ya?ml|txt|sh)\b",
+               " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"[]，。！？、；：""''（）【】《》,.!?;:'\"(){}[\\~`@#$%^&+=]+", " ", s)
+    s = re.sub(r"\s+", "-", s.strip())
+    s = re.sub(r"-+", "-", s).strip("-")
+    if len(s) <= max_chars:
+        return s
+    # 超长时丢掉末尾那个被截断的半截词，避免得到 "…-打印-Hello-M" 这种断尾
+    s = s[:max_chars]
+    if "-" in s:
+        s = s[: s.rfind("-")]
+    return s.rstrip("-")
+
+
 # ----------------------------------------------------------------------------
 # 运行结果
 # ----------------------------------------------------------------------------
@@ -93,6 +116,7 @@ class RunResult:
     elapsed: float = 0.0
     compacted: int = 0
     error_message: str = ""
+    task_dir: str = ""            # 本次任务产物的存放目录（workspace 下的子文件夹）
 
     @property
     def succeeded(self) -> bool:
@@ -140,10 +164,82 @@ class AgentLoop:
         self.history = History(self.system_prompt)
         self.ctx: ToolContext = build_tool_context(config, console=console, session={})
 
+        # 任务级工作区：workspace_root 是"所有生成代码的家"，
+        # 每个具体任务会在它下面拥有一个独立子目录（见 prepare_task_dir）。
+        # 取自 config.workspace_root 而非 resolved_workspace()，因为后者会随任务切换而变。
+        root = getattr(config, "workspace_root", None) or config.workspace
+        self.workspace_root: Path = Path(str(root)).expanduser().resolve()
+        self._task_dir: Optional[Path] = None
+
         self._fingerprints: Deque[str] = deque(maxlen=6)
         self._stale_steps = 0
         self._consecutive_errors = 0
         self._usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    # ------------------------------------------------------------------
+    # 任务级工作区
+    # ------------------------------------------------------------------
+    @property
+    def task_dir(self) -> Optional[Path]:
+        """当前任务的子目录（还没跑过任务时为 None）。"""
+        return self._task_dir
+
+    def prepare_task_dir(self, task: str, force_new: bool = False) -> Path:
+        """为本次任务准备独立子目录，返回该目录路径。
+
+        首次调用（或 force_new=True）时在 workspace_root 下新建
+        `<时间戳>-<任务摘要>` 子目录，并把路径沙箱与系统提示词切到该目录。
+        同一会话内的后续追问会**沿用**当前目录，直到用 /new 开启新任务——
+        否则追问（如"再改成降序"）时模型将看不到上一轮刚生成的文件。
+
+        这样每个任务的代码、备份（.agent_backups）与会话日志（.agent_sessions）
+        都归拢在自己的文件夹里，任务之间互不干扰。
+        """
+        if not getattr(self.config, "per_task_dir", True):
+            # 关闭任务子目录：所有任务共用 workspace 根目录
+            self._task_dir = self.workspace_root
+            return self._task_dir
+
+        if self._task_dir and not force_new:
+            return self._task_dir
+
+        self._task_dir = self._make_task_dir(task)
+        self._apply_task_dir()
+        return self._task_dir
+
+    def _make_task_dir(self, task: str) -> Path:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        slug = _slugify(task)
+        base = f"{stamp}-{slug}" if slug else stamp
+        candidate = self.workspace_root / base
+        n = 2
+        while candidate.exists():          # 同一秒撞名则加序号
+            candidate = self.workspace_root / f"{base}-{n}"
+            n += 1
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def _apply_task_dir(self) -> None:
+        """把沙箱上下文与系统提示词切换到当前任务目录。"""
+        assert self._task_dir is not None
+        self.config.workspace = str(self._task_dir)
+        # 复用 session，保住 changes / command_guard 等会话状态，只换沙箱根目录
+        self.ctx = build_tool_context(
+            self.config, console=self.console, session=self.ctx.session if self.ctx else {}
+        )
+        self.ctx.session.setdefault("changes", [])
+
+        self.system_prompt = build_system_prompt(
+            tool_list=self.registry.describe(),
+            workspace=str(self._task_dir),
+            native_tools=self.native,
+            restrict_to_workspace=self.config.restrict_to_workspace,
+        )
+        self.history.system_prompt = self.system_prompt
+        if self.history.messages and self.history.messages[0].get("role") == "system":
+            self.history.messages[0]["content"] = self.system_prompt
+        else:
+            self.history.reset()
 
     # ------------------------------------------------------------------
     # 对外入口
@@ -161,6 +257,8 @@ class AgentLoop:
         """
         started = time.time()
         result = RunResult()
+        # 每个任务一个独立子目录：首次进入时创建，同会话后续追问沿用
+        result.task_dir = str(self.prepare_task_dir(task))
         self.ctx.session.setdefault("changes", [])
         self.ctx.session.pop("finished", None)
         self.ctx.session.pop("summary", None)
