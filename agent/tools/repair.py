@@ -32,6 +32,12 @@ __all__ = ["rollback", "register"]
                 "description": "可选：指定要恢复到的快照名（不含路径）；不填则用最新的一份",
                 "default": "",
             },
+            "files": {
+                "type": "array",
+                "description": "可选：只恢复这些文件（相对任务目录，如 [\"calc.py\"]）；不填则恢复整个快照",
+                "items": {"type": "string"},
+                "default": [],
+            },
         },
     },
     category="控制",
@@ -65,24 +71,45 @@ def rollback(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         else:
             return ToolResult.failure(f"找不到指定的快照：{args['target']}")
 
+    only_files = [str(f) for f in (args.get("files") or [])]
     dest = ctx.workspace
     dest.mkdir(parents=True, exist_ok=True)
     count = 0
-    for item in target.iterdir():
-        if item.name.startswith("."):   # 跳过 .agent_sessions 等内部目录
-            continue
-        tgt = dest / item.name
-        if item.is_dir():
-            shutil.rmtree(tgt, ignore_errors=True)
-            shutil.copytree(item, tgt)
-        else:
-            shutil.copy2(item, tgt)
-        count += 1
+    if only_files:
+        # 单文件级回退：只从快照里挑指定的文件恢复
+        for rel in only_files:
+            src = (target / rel).resolve()
+            # 防止越界读取快照目录之外的文件
+            if target != src and target not in src.parents:
+                return ToolResult.failure(f"非法的文件路径：{rel}", hint="请使用相对任务目录的文件名。")
+            if not src.exists():
+                return ToolResult.failure(f"快照中不存在文件：{rel}")
+            tgt = dest / rel
+            tgt.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.rmtree(tgt, ignore_errors=True)
+                shutil.copytree(src, tgt)
+            else:
+                shutil.copy2(src, tgt)
+            count += 1
+        summary = f"已从快照 `{target.name}` 恢复 {count} 个指定文件"
+    else:
+        for item in target.iterdir():
+            if item.name.startswith("."):   # 跳过 .agent_sessions 等内部目录
+                continue
+            tgt = dest / item.name
+            if item.is_dir():
+                shutil.rmtree(tgt, ignore_errors=True)
+                shutil.copytree(item, tgt)
+            else:
+                shutil.copy2(item, tgt)
+            count += 1
+        summary = f"已回滚到快照 `{target.name}`，恢复了 {count} 个项目到 `{ctx.guard.relpath(dest)}`"
 
     ctx.record_change("rollback", target.name)
     return ToolResult.success(
-        f"已回滚到快照 `{target.name}`，恢复了 {count} 个项目到 `{ctx.guard.relpath(dest)}`。",
-        meta={"rollback_to": target.name, "restored": count},
+        summary + "。",
+        meta={"rollback_to": target.name, "restored": count, "files": only_files},
     )
 
 

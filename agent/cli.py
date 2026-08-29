@@ -34,6 +34,7 @@ BANNER_HELP = """\
   /tools             列出可用工具及其签名
   /config            显示当前生效配置（密钥自动打码）
   /stats             显示本次会话的统计信息
+  /diff              查看本次会话改了哪些文件（unified diff）
   /compact           手动压缩上下文
   /undo              撤销最近一次文件写入（覆盖写前自动备份）
   /new [任务名]      切换到另一个任务；同名任务沿用 workplace 下已有目录
@@ -216,6 +217,9 @@ def _repl(loop: AgentLoop, console: Console) -> int:
                     console.echo(f"  {k} = {getattr(loop.config, k)}")
             elif cmd == "/stats":
                 console.echo(loop.build_stats_panel())
+            elif cmd == "/diff":
+                from .tools.review import build_diff
+                console.echo(build_diff(loop.ctx.session.get("changes", [])))
             elif cmd == "/compact":
                 if loop.history.compact(llm=loop.backend, keep_recent=loop.config.compact_keep_recent):
                     console.info(f"压缩完成，当前 ≈{loop.history.tokens} tokens")

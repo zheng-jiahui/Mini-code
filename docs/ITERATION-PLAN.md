@@ -34,7 +34,7 @@
 | V2 | 自修复闭环 | ✅ 已完成 |
 | V3 | 上下文与成本治理 | ✅ 已完成 |
 | V6 | 交付打磨 | ✅ 已完成 |
-| V4 | 可审阅性 | ⬜ 待做 |
+| V4 | 可审阅性 | ✅ 已完成 |
 | V5 | 自主性增强 | ⬜ 待做 |
 
 ---
@@ -219,11 +219,34 @@
 
 ---
 
-## V4 可审阅性 ⬜ 待做
+## V4 可审阅性 ✅
 
-- unified diff 预览，改前让模型/用户看到将要发生什么
-- `/diff` 命令查看本次会话改了什么
-- 单文件级回退（从「第 N 次」快照选择性恢复某个文件，而非整目录回滚）
+**commit**：（见 git log：feat: V4 可审阅性）
+
+**动机**：coding agent 最怕"改了一堆自己都没看清"——无论是对模型还是对用户，改动都应是可审阅的。
+
+**改动清单**：
+1. **before/after 采集**（`agent/tools/base.py::ToolContext.record_change`）
+   扩展签名接受 `before`/`after`/`path`；`write_file`/`edit_block` 在落盘时记录改动前后内容
+   （两侧均超 50KB 自动跳过，避免大文件撑爆会话内存）。
+2. **unified diff 渲染**（`agent/tools/review.py::build_diff` + `diff` 工具）
+   把本次会话的 changes 渲染成标准 unified diff；新建文件（before=None）显示为全量新增，
+   超大数据只列摘要。既是用户的 `/diff` 命令，也是模型可调用的 `diff` 工具——finish 前自查改动。
+3. **`/diff` 命令**（`agent/cli.py`）+ 帮助菜单补 `/diff` 一行。
+4. **单文件级回退**（`agent/tools/repair.py::rollback` 新增 `files` 参数）
+   从「第 N 次」快照里只恢复指定文件（如 `rollback(files=["calc.py"])`），而非整目录回滚；
+   做了路径越界校验，杜绝 `../` 逃逸。
+
+**实测**：
+- 单测 `test_diff_renders_unified_diff_of_session_changes`：写→改一行→diff，历史里出现 `--- a/` `+++ b/` 与新旧两行。
+- 单测 `test_single_file_rollback_restores_only_named_file`：两文件改坏后只回滚 good.py，bad.py 保持坏状态。
+- 单测 `test_build_diff_handles_new_and_unchanged`：新建/无变化/超大数据三类边界都正确渲染。
+- 3 个新用例，共 **39** 个全通过。
+
+**答辩要点**：
+- 可审阅性 = 把"模型改了什么"从黑盒变成可读的 diff；这既是安全网（防意外提交），
+  也是自纠错信号（模型能在 finish 前发现"我其实改错了"）。
+- 单文件回退比整目录回滚更细粒度，代价只是快照里多一次"挑文件"拷贝——能力从既有归档自然长出。
 
 ---
 
@@ -260,3 +283,4 @@
 - 2026-08-30 02:20 — V3 上下文与成本治理完成，31 个测试通过；
   精确 token（tiktoken 优先）+ 智能压缩（信号行优先，并修 render 漏 import 的 NameError）+ /stats 成本面板
 - 2026-08-30 03:10 — V6 交付打磨完成，36 个测试通过；DESIGN.md + 视频脚本 + README 定稿（586 字）+ 历史复核干净
+- 2026-08-30 03:50 — V4 可审阅性完成，39 个测试通过；before/after 采集 + unified diff（/diff 与 diff 工具）+ 单文件级 rollback

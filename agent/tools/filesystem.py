@@ -132,6 +132,7 @@ def write_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 
     existed = target.exists()
     old_lines = 0
+    old_text = ""
     backup_path = ""
 
     if existed:
@@ -140,6 +141,7 @@ def write_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
             old_lines = len(old_text.splitlines())
         except OSError:
             old_lines = 0
+            old_text = ""
         if not append and getattr(ctx.config, "backup_on_write", True):
             backup_path = _backup(ctx, target)
 
@@ -154,7 +156,9 @@ def write_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         raise ToolError(f"写入失败：{exc}", tool="write_file", hint="检查路径是否越界、文件是否被占用或只读。") from exc
 
     new_lines = len(content.splitlines())
-    ctx.record_change("write", _rel(ctx, target))
+    before_text = old_text if existed else None
+    after_text = (old_text + content) if append else content
+    ctx.record_change("write", _rel(ctx, target), before=before_text, after=after_text, path=_rel(ctx, target))
 
     detail = f"{'追加' if append else '写入'} {_rel(ctx, target)}：{old_lines} → {new_lines} 行，{len(content)} 字符"
     if backup_path:
@@ -239,7 +243,7 @@ def edit_block(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         raise ToolError(f"写入失败：{exc}", tool="edit_block",
                         hint="文件可能只读或被其它程序占用。") from exc
 
-    ctx.record_change("edit", _rel(ctx, target))
+    ctx.record_change("edit", _rel(ctx, target), before=original, after=new_content, path=_rel(ctx, target))
 
     line_no = original.count("\n", 0, matches[0]) + 1
     delta = len(new_content.splitlines()) - len(original.splitlines())

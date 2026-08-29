@@ -778,6 +778,71 @@ def test_list_dir_shows_tree():
 
 
 # ----------------------------------------------------------------------------
+# V4：可审阅性（unified diff 预览 / /diff / 单文件级回退）
+# ----------------------------------------------------------------------------
+def test_diff_renders_unified_diff_of_session_changes():
+    """diff 工具应把本次会话的改动渲染成 unified diff，便于 finish 前自查。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        script = [
+            {"content": "写文件。", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "a.py", "content": "print('hi')\n"}}]},
+            {"content": "改一行。", "tool_calls": [
+                {"name": "edit_block", "arguments": {
+                    "path": "a.py", "old_text": "print('hi')", "new_text": "print('hello')"}}]},
+            {"content": "看 diff。", "tool_calls": [
+                {"name": "diff", "arguments": {}}]},
+            {"content": "完成。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "ok"}}]},
+        ]
+        backend, profile = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        result = loop.run("写文件并改一行")
+        assert result.succeeded
+        # diff 工具是最后一轮模型调用，它的回执（unified diff）应进了历史
+        joined = "\n".join(m.get("content", "") for m in loop.history.messages)
+        assert "print('hi')" in joined and "print('hello')" in joined
+        assert "--- a/" in joined and "+++ b/" in joined, "应出现 unified diff 的分隔头"
+
+
+def test_single_file_rollback_restores_only_named_file():
+    """rollback 的 files 参数应只恢复指定文件，而非整目录回滚。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, _, registry, _ = _make_env(tmp, per_task_dir=True)
+        backend, profile = _scripted([{"content": "x", "tool_calls": []}])
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        task_dir = loop.prepare_task_dir("demo")
+        (Path(task_dir) / "good.py").write_text("print('ok')\n", encoding="utf-8")
+        (Path(task_dir) / "bad.py").write_text("print('ok')\n", encoding="utf-8")
+        loop.ctx.session["changes"] = [{"kind": "write", "detail": "good.py"}, {"kind": "write", "detail": "bad.py"}]
+        snap = loop.snapshot_to_backups()
+        assert snap is not None
+        # 把两个都改坏
+        (Path(task_dir) / "good.py").write_text("print('BROKEN')\n", encoding="utf-8")
+        (Path(task_dir) / "bad.py").write_text("print('BROKEN')\n", encoding="utf-8")
+        # 只恢复 good.py
+        r = registry.execute("rollback", {"files": ["good.py"]}, loop.ctx)
+        assert r.ok, r.render()
+        assert (Path(task_dir) / "good.py").read_text(encoding="utf-8") == "print('ok')\n"
+        # bad.py 不应被恢复
+        assert (Path(task_dir) / "bad.py").read_text(encoding="utf-8") == "print('BROKEN')\n"
+
+
+def test_build_diff_handles_new_and_unchanged():
+    from agent.tools.review import build_diff
+    # 新建文件（before=None）应显示为全量新增；内容无变化的标"无变化"
+    changes = [
+        {"kind": "write", "detail": "new.py", "path": "new.py", "before": None, "after": "x = 1\n"},
+        {"kind": "edit", "detail": "same.py", "path": "same.py", "before": "y = 1\n", "after": "y = 1\n"},
+        {"kind": "write", "detail": "big.py", "path": "big.py", "before": None, "after": None},  # 超大数据未采集
+    ]
+    text = build_diff(changes)
+    assert "+x = 1" in text
+    assert "内容无变化" in text
+    assert "改动过大" in text or "未生成 diff" in text
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

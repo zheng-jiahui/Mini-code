@@ -50,9 +50,22 @@ class ToolContext:
             return default
         return self.console.confirm(question, default=default)
 
-    def record_change(self, kind: str, detail: str) -> None:
-        """记录本次会话产生的副作用（用于结尾汇总"改了哪些文件"）。"""
-        self.session.setdefault("changes", []).append({"kind": kind, "detail": detail, "ts": time.time()})
+    def record_change(self, kind: str, detail: str, *,
+                       before: Optional[str] = None, after: Optional[str] = None,
+                       path: Optional[str] = None) -> None:
+        """记录本次会话产生的副作用（用于结尾汇总"改了哪些文件"与生成 diff）。
+
+        before/after 只在两侧都不超大时保存（避免大文件撑爆会话内存），
+        用于 /diff 与 diff 工具生成 unified diff。
+        """
+        cap = 50_000
+        keep = before is not None and after is not None and len(before) <= cap and len(after) <= cap
+        self.session.setdefault("changes", []).append({
+            "kind": kind, "detail": detail, "ts": time.time(),
+            "path": path,
+            "before": before if keep else None,
+            "after": after if keep else None,
+        })
 
 
 # ----------------------------------------------------------------------------
