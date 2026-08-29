@@ -24,8 +24,16 @@ python run.py --mock -t "演示一次工具调用"        # 离线演示：不�
 python run.py --list-tools                     # 查看全部工具
 ```
 
-> 想换模型只需改 `config.yaml` 的 `llm.model`，或通过环境变量临时覆盖：
-> `AGENT_MODEL=deepseek-chat AGENT_BASE_URL=https://api.deepseek.com python run.py`
+**切换模型档位**（档位在 `config.yaml` 的 `profiles` 下配置，可同时配多个端点）：
+
+```bash
+python run.py --list-profiles                  # 列出全部档位（* 为当前生效）
+python run.py --profile deepseek -t "..."      # 用指定档位跑一次
+AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆盖，优先级高于配置文件
+```
+
+> `AGENT_*` 系列环境变量优先级最高：`AGENT_API_KEY` / `AGENT_BASE_URL` / `AGENT_MODEL` /
+> `AGENT_TEMPERATURE` / `AGENT_PROFILE` / `AGENT_WORKSPACE` / `AGENT_CONFIG`。
 
 ---
 
