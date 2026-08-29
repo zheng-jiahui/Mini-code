@@ -32,7 +32,7 @@
 | V0.5 | 多密钥自动轮换 | ✅ 已完成 |
 | V1 | 可靠性加固 | ✅ 已完成 |
 | V2 | 自修复闭环 | ✅ 已完成 |
-| V3 | 上下文与成本治理 | ⬜ 待做 |
+| V3 | 上下文与成本治理 | ✅ 已完成 |
 | V6 | 交付打磨 | ⬜ 待做 |
 | V4 | 可审阅性 | ⬜ 待做 |
 | V5 | 自主性增强 | ⬜ 待做 |
@@ -156,16 +156,43 @@
 
 ---
 
-## V3 上下文与成本治理 ⬜ 待做
+## V3 上下文与成本治理 ✅
 
-**动机**：评委大概率会问"长任务怎么不超窗"，要能报出数字而不是空谈。
+**commit**：（见 git log：feat: V3 上下文与成本治理）
+
+**动机**：评委大概率会问"长任务怎么不超窗 / 花了多少"，要能报出数字而不是空谈。
 
 **改动清单**：
-1. 精确 token 计数，替换现在的估算（`agent/history.py::count_messages_tokens`）
-2. 工具回执智能压缩：按关键信息提取，而非简单 head+tail 截断
-3. 会话成本面板：token 数 / 耗时 / 工具调用数 / 压缩次数 / 各工具耗时占比
+1. **精确 token 计数**（`agent/history.py`）
+   `count_messages_tokens` 优先用 `tiktoken(cl100k_base)`（本机 venv 已装，真正精确），
+   未安装时回落到偏保守的启发式（英文 4 字符/token、CJK 1.3 字符/token）。
+   新增 `token_counter_name()` 暴露当前实际用的是哪种计数方式，面板里如实标注。
+   关键认知："发送前"的上下文预算用估算即可；**真正精确的消耗来自 API 返回的 `usage`**。
+2. **工具回执智能压缩**（`agent/security.py::smart_compress` + `agent/tools/base.py`）
+   旧 `truncate_output` 是纯 head+tail，会把中间的 traceback 丢掉。新版「信息优先」：
+   先保住 signal 行（error/traceback/exception/assert/exit code/失败/异常…），再补首尾；
+   **预算仍不够时信号行永远最高优先级**，head/tail 在剩余预算内硬截断——绝不让 traceback 被丢进省略号。
+   修了一处真实 bug：`base.py::ToolResult.render` 调用了 `smart_compress` 却没 import，
+   任何超长回执都会 `NameError`；已补 import。
+3. **会话成本面板 `/stats`**（`agent/loop.py::build_stats_panel` + `agent/cli.py`）
+   CLI 的 `/stats` 从"只报轮数/估算 tokens"升级为完整面板：
+   真实 token（prompt/completion/total，来自 API usage）、当前上下文估算与计数方式、
+   会话耗时、工具调用总数、上下文压缩次数、回执智能压缩次数、各工具耗时占比。
+   loop 新增会话级画像：`_tool_timings` / `_tool_calls_by_name` / `_output_compressions`（跨任务累计）。
 
-**验收**：`/stats` 能报出本次会话的真实 token 消耗。
+**实测**：
+- 单测 `test_stats_panel_reports_real_tokens_and_tool_breakdown`：MockBackend 跑「写→运行→finish」，
+  面板报 total=450（3 轮 × 150，与脚本 usage 吻合），run_command/write_file 出现在耗时占比里。
+- 单测 `test_stats_panel_counts_output_compressions`：超长输出触发智能压缩，面板记「回执智能压缩次数：1」。
+- 单测 `test_smart_compress_keeps_signal_lines`：60 行日志夹 traceback，压缩后仍含 Traceback/ZeroDivisionError。
+- 单测 `test_tool_result_render_uses_smart_compress_no_nameerror`：回归上述 import bug。
+- 5 个新用例，共 **31** 个全通过。
+
+**答辩要点**：
+- "估算"和"真实"是两件事：上下文预算用估算（够用且不必等网络），成本对账用 API `usage`（最准）。
+  把两者分开，既不会超窗，也能报出可信的数字。
+- 智能压缩的核心是"信号行优先于首尾"——模型排错最需要的恰恰是中间的 traceback，纯 head+tail 恰恰丢掉它。
+  预算兜底逻辑保证信号行在再紧的预算下也存活，这是和"截断"的本质区别。
 
 ---
 
@@ -217,3 +244,5 @@
   新增"假完成"拦截
 - 2026-08-30 01:10 — V2 自修复闭环完成，27 个测试通过；
   新增 selfrepair 感知层（测试命令识别 / traceback 定位上下文）+ rollback 工具 + 修复预算
+- 2026-08-30 02:20 — V3 上下文与成本治理完成，31 个测试通过；
+  精确 token（tiktoken 优先）+ 智能压缩（信号行优先，并修 render 漏 import 的 NameError）+ /stats 成本面板

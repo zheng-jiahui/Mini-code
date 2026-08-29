@@ -18,7 +18,7 @@ from typing import Iterable, List, Optional, Tuple
 
 from .errors import SecurityError
 
-__all__ = ["PathGuard", "CommandGuard", "truncate_output", "redact_secrets", "check_command"]
+__all__ = ["PathGuard", "CommandGuard", "truncate_output", "smart_compress", "redact_secrets", "check_command"]
 
 # 默认的敏感目录/文件（连读都不建议）
 _SENSITIVE_NAMES = {".env", ".env.local", "id_rsa", "id_ed25519", ".npmrc", ".pypirc", "credentials", "secrets.yaml", "config.yaml"}
@@ -169,6 +169,75 @@ def truncate_output(text: str, max_chars: int, *, note: str = "输出过长已�
         f"\n... [省略 {omitted} 字符：{note}] ...\n\n"
         f"{text[-tail:]}"
     )
+
+
+# 被视为"关键信息"的行特征：出错 / 失败 / 退出码等
+_SIGNAL_KEYWORDS = (
+    "error", "traceback", "exception", "assert", "failed", "fail", "✗", "❌",
+    "exit code", "warning", "错误", "失败", "异常",
+)
+
+
+def _hard_truncate(text: str, max_chars: int, *, tail: bool = False,
+                   note: str = "输出过长已截断") -> str:
+    """纯字符级硬截断（用于信号行也超长、或没有信号行的退路）。"""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if tail:
+        return f"... [{note}] ...\n" + text[-max_chars:]
+    return text[:max_chars] + f"\n... [{note}] ..."
+
+
+def smart_compress(text: str, max_chars: int, *, note: str = "输出过长已智能压缩") -> str:
+    """为工具回执做「信息优先」的压缩：优先保留出错/关键行与首尾结论。
+
+    与纯 head+tail 的区别：输出里夹着 traceback / assert / exit code 这类关键行时，
+    它们往往在中间，纯截断会丢掉。这里先保住这些「信号行」，再补头部与尾部。
+
+    预算不够时（signal+head+tail 仍超长）：**信号行始终最高优先级**，head/tail 在
+    剩余预算内做硬截断——绝不能把 traceback 丢进省略号里而只保留首尾的无关日志。
+    """
+    if max_chars <= 0 or text is None:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    lines = text.splitlines()
+    if len(lines) <= 1:
+        return _hard_truncate(text, max_chars, note=note)
+
+    signal_idx = {i for i, ln in enumerate(lines)
+                  if any(k in ln.lower() for k in _SIGNAL_KEYWORDS)}
+    head_n = max(1, int(len(lines) * 0.12))
+    tail_n = max(1, int(len(lines) * 0.30))
+
+    # 必保：头部 + 尾部 + 信号行（去重后保持原顺序）
+    keep = set(range(head_n)) | set(range(max(0, len(lines) - tail_n), len(lines))) | signal_idx
+    kept = [lines[i] for i in sorted(keep)]
+    assembled = "\n".join(kept)
+    if len(assembled) <= max_chars:
+        return assembled + f"\n\n... [共 {len(lines)} 行，{note}] ..."
+
+    # 超预算：信号行最高优先级，head/tail 在剩余预算内硬截断
+    signal_lines = [lines[i] for i in sorted(signal_idx)]
+    signal_text = "\n".join(signal_lines)
+    if signal_text:
+        if len(signal_text) > max_chars:
+            return _hard_truncate(signal_text, max_chars, note=note)
+        budget = max_chars - len(signal_text) - 12
+        head_part = "\n".join(lines[:head_n])
+        tail_part = "\n".join(lines[-tail_n:])
+        if len(head_part) + len(tail_part) <= budget:
+            body = head_part + "\n...\n" + tail_part
+        else:
+            hb = budget // 2
+            tb = budget - hb
+            body = _hard_truncate(head_part, hb) + "\n...\n" + _hard_truncate(tail_part, tb, tail=True)
+        return signal_text + "\n...\n" + body + f"\n\n... [共 {len(lines)} 行，含关键错误行，{note}] ..."
+
+    # 没有信号行：退回纯 head+tail 截断
+    return truncate_output(text, max_chars, note=note)
 
 
 def redact_secrets(text: str) -> str:

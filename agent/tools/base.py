@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from ..errors import SecurityError, ToolError
-from ..security import PathGuard, redact_secrets, truncate_output
+from ..security import PathGuard, redact_secrets, smart_compress, truncate_output
 
 __all__ = ["ToolContext", "ToolResult", "ToolSpec", "ToolRegistry", "tool_spec"]
 
@@ -103,7 +103,7 @@ class ToolResult:
         body = self.output or "(无输出)"
         body = redact_secrets(body)
         if max_chars and len(body) > max_chars:
-            body = truncate_output(body, max_chars, note="工具回执过长")
+            body = smart_compress(body, max_chars, note="工具回执过长")
         return body
 
     def to_message(self, call_id: str, name: str, style: str = "native") -> Dict[str, Any]:

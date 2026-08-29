@@ -215,12 +215,7 @@ def _repl(loop: AgentLoop, console: Console) -> int:
                           "command_policy", "restrict_to_workspace", "backup_on_write", "auto_compact"):
                     console.echo(f"  {k} = {getattr(loop.config, k)}")
             elif cmd == "/stats":
-                console.echo(f"对话轮数={loop.history.turn_count()} 上下文≈{loop.history.tokens} tokens "
-                             f"压缩次数={loop.history.compact_count}")
-                changes = loop.ctx.session.get("changes", [])
-                console.echo(f"本次会话改动 {len(changes)} 项：")
-                for c in changes[-10:]:
-                    console.echo(f"  [{c['kind']}] {c['detail'][:100]}")
+                console.echo(loop.build_stats_panel())
             elif cmd == "/compact":
                 if loop.history.compact(llm=loop.backend, keep_recent=loop.config.compact_keep_recent):
                     console.info(f"压缩完成，当前 ≈{loop.history.tokens} tokens")

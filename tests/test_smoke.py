@@ -642,6 +642,88 @@ def test_self_repair_feeds_traceback_context_and_recovers():
 
 
 # ----------------------------------------------------------------------------
+# V3：上下文与成本治理（智能压缩 / 精确 token / /stats 成本面板）
+# ----------------------------------------------------------------------------
+def test_smart_compress_keeps_signal_lines():
+    """智能压缩应保住 traceback 这类关键「信号行」，而非纯 head+tail 丢掉中间。"""
+    from agent.security import smart_compress
+    lines = [f"无关日志行 {i}" for i in range(1, 60)]
+    lines[30] = "Traceback (most recent call last):"
+    lines[31] = "  File 'a.py', line 5, in <module>"
+    lines[32] = "ZeroDivisionError: division by zero"
+    text = "\n".join(lines)
+    out = smart_compress(text, max_chars=200, note="压缩")
+    assert "Traceback" in out
+    assert "ZeroDivisionError" in out
+    assert "无关日志行" in out   # 首尾仍保留
+
+
+def test_smart_compress_short_text_unchanged():
+    from agent.security import smart_compress
+    # 未超长 → 原样返回
+    assert smart_compress("短文本", max_chars=200) == "短文本"
+    # 超长但单行且无信号行 → 退回 head+tail 截断（长度被砍）
+    long_one = "A" * 300
+    out = smart_compress(long_one, max_chars=50, note="压缩")
+    assert len(out) <= 50 + 120   # 截断 + 省略提示，明显短于原文
+
+
+def test_tool_result_render_uses_smart_compress_no_nameerror():
+    """回归：ToolResult.render 必须已导入 smart_compress，否则超长回执会 NameError。"""
+    from agent.tools.base import ToolResult
+    big = "正常输出一行\n" * 60   # 远超默认 max_chars
+    r = ToolResult.success(big)
+    rendered = r.render(max_chars=80)
+    assert len(rendered) < len(big)
+    assert "省略" in rendered or "压缩" in rendered
+
+
+def test_stats_panel_reports_real_tokens_and_tool_breakdown():
+    """/stats 面板应报出真实 token（来自 API usage）与按工具拆分的耗时占比。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        script = [
+            {"content": "写。", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "a.py", "content": "print(1)\n"}}]},
+            {"content": "跑。", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "python a.py"}}]},
+            {"content": "完成。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "ok"}}]},
+        ]
+        backend, profile = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        result = loop.run("写脚本并运行")
+        assert result.succeeded
+
+        panel = loop.build_stats_panel()
+        # MockBackend 每轮 usage = {prompt:100, completion:50, total:150}，本任务 3 轮模型调用 → 450
+        assert "total" in panel
+        assert "450" in panel, panel
+        assert "run_command" in panel, "各工具耗时占比应含 run_command"
+        assert "write_file" in panel
+        assert "工具调用总数：3" in panel, panel
+
+
+def test_stats_panel_counts_output_compressions():
+    """超长工具回执被智能压缩时，面板里的『回执智能压缩次数』应 +1。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp, max_tool_output_chars=80)
+        # 打印 300 个 A（超过 80 → 触发压缩）
+        script = [
+            {"content": "长输出。", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "python -c \"print('A'*300)\""}}]},
+            {"content": "完成。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "ok"}}]},
+        ]
+        backend, profile = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        result = loop.run("产生一个超长输出的命令")
+        assert result.succeeded
+        assert loop._output_compressions >= 1, "应记录一次回执压缩"
+        assert "回执智能压缩次数：1" in loop.build_stats_panel()
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

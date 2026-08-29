@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from .errors import LLMError
 from .llm import AssistantMessage
 
-__all__ = ["History", "estimate_tokens", "count_messages_tokens"]
+__all__ = ["History", "estimate_tokens", "count_messages_tokens", "token_counter_name"]
 
 try:  # tiktoken 可选：装了就更精准，没装就走启发式
     import tiktoken  # type: ignore
@@ -46,8 +46,14 @@ _OVERHEAD_PER_MESSAGE = 4  # role/分隔符等固定开销（OpenAI 的经验值
 def estimate_tokens(text: str) -> int:
     """估算文本的 token 数。
 
-    优先 tiktoken；不可用时用启发式：
-        英文/数字 ≈ 4 字符 1 token；中日韩 ≈ 1 字符 1.5 token（保守偏高估）。
+    优先级：tiktoken(cl100k_base) > 启发式。
+
+    启发式经验值（与 cl100k_base 量级接近，偏保守）：
+        英文/数字 ≈ 4 字符 1 token；中日韩 ≈ 1.3 字符 1 token。
+    预算控制宁可"早压缩"也不要"低估到请求超窗"，所以略偏高估是安全的。
+
+    注意：这里是「发给模型之前」的估算，用于上下文预算。真正精确的消耗
+    来自 API 返回的 usage 字段（见 AgentLoop 的 /stats 面板），两者用途不同。
     """
     if not text:
         return 0
@@ -58,7 +64,14 @@ def estimate_tokens(text: str) -> int:
             pass
     cjk = len(_CJK.findall(text))
     ascii_len = len(text) - cjk
-    return int(ascii_len / 4 + cjk * 1.5) + 1
+    return int(ascii_len / 4 + cjk / 1.3) + 1
+
+
+def token_counter_name() -> str:
+    """当前 count_messages_tokens 实际使用的计数方式（决定估算精度）。"""
+    if _ENC is not None:
+        return "tiktoken:cl100k_base（精确）"
+    return "启发式估算（未安装 tiktoken，偏保守）"
 
 
 def count_messages_tokens(messages: Sequence[Dict[str, Any]]) -> int:

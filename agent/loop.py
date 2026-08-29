@@ -182,6 +182,13 @@ class AgentLoop:
         self._consecutive_run_failures = 0   # 连续 run_command 失败次数（自修复预算）
         self._usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
+        # V3 成本治理：会话级画像（跨任务累计，REPL 里 /stats 给出整体视图）
+        self._tool_timings: Dict[str, float] = {}       # 工具名 → 累计耗时（秒）
+        self._tool_calls_by_name: Dict[str, int] = {}  # 工具名 → 调用次数
+        self._total_tool_calls = 0
+        self._output_compressions = 0     # 工具回执因超长被智能压缩的次数
+        self._session_started = time.time()
+
     # ------------------------------------------------------------------
     # 任务级工作区
     # ------------------------------------------------------------------
@@ -474,6 +481,7 @@ class AgentLoop:
         """
         for call in calls:
             result.tool_calls += 1
+            self._total_tool_calls += 1
             self._emit("tool_call", {"name": call.name, "args": call.arguments})
             if self.console:
                 self.console.tool_call(call.name, call.arguments)
@@ -503,6 +511,9 @@ class AgentLoop:
                 return "finish"
 
             tool_result = self.registry.execute(call.name, call.arguments, self.ctx, call_id=call.id)
+            # 累计各工具耗时与调用次数（成本面板的"各工具耗时占比"用）
+            self._tool_timings[call.name] = self._tool_timings.get(call.name, 0.0) + tool_result.elapsed
+            self._tool_calls_by_name[call.name] = self._tool_calls_by_name.get(call.name, 0) + 1
 
             # 自修复闭环：run_command 失败时，把「出错位置 + 附近源码」直接回灌给模型，
             # 省掉它多一轮 read_file；连续失败达到预算时提醒停止乱试、考虑回滚。
@@ -515,6 +526,9 @@ class AgentLoop:
             # 回执写回历史：原生调用用 tool 角色，文本协议调用用 user 角色
             style = "native" if call.source == "native" else "text"
             rendered = tool_result.render(max_chars=int(self.config.max_tool_output_chars))
+            # 超长回执被智能压缩，记一次（成本面板展示"回执智能压缩次数"）
+            if len(tool_result.output or tool_result.error or "") > int(self.config.max_tool_output_chars):
+                self._output_compressions += 1
             self.history.add_tool_result(call.id, call.name, rendered, style=style)
 
             self._emit("tool_result", {"name": call.name, "ok": tool_result.ok, "output": rendered[:400]})
@@ -612,6 +626,41 @@ class AgentLoop:
         if self._stale_steps >= 2:
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # 成本面板（V3）
+    # ------------------------------------------------------------------
+    def build_stats_panel(self) -> str:
+        """生成会话成本面板，供 CLI 的 `/stats` 命令与答辩演示使用。
+
+        包含：真实 token 消耗（API usage）、当前上下文估算、会话耗时、
+        工具调用总数、上下文/回执压缩次数、各工具耗时占比。
+
+        设计要点：token 以「API 实际返回的 usage」为准（最精确），
+        上下文估算只用于"发送前"的预算判断，二者来源不同、用途不同。
+        """
+        from .history import token_counter_name
+
+        u = self._usage
+        lines = ["【会话成本面板 /stats】",
+                 "  真实 token 消耗（来自 API usage，最精确）：",
+                 f"    prompt     = {u.get('prompt_tokens', 0):,}",
+                 f"    completion = {u.get('completion_tokens', 0):,}",
+                 f"    total      = {u.get('total_tokens', 0):,}",
+                 f"  当前上下文估算：{self.history.tokens:,} tokens（计数方式：{token_counter_name()}）",
+                 f"  会话耗时：{time.time() - self._session_started:.1f}s",
+                 f"  工具调用总数：{self._total_tool_calls}",
+                 f"  上下文压缩次数：{self.history.compact_count}    回执智能压缩次数：{self._output_compressions}"]
+        if self._tool_timings:
+            total_t = sum(self._tool_timings.values())
+            lines.append("  各工具耗时占比：")
+            for name, t in sorted(self._tool_timings.items(), key=lambda kv: kv[1], reverse=True):
+                pct = (t / total_t * 100) if total_t > 0 else 0.0
+                n = self._tool_calls_by_name.get(name, 0)
+                lines.append(f"    {name:<14} {t:7.2f}s  {pct:5.1f}%  ({n} 次)")
+        else:
+            lines.append("  各工具耗时占比：本次会话尚未调用任何工具")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # 辅助
