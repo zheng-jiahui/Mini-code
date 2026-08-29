@@ -13,7 +13,7 @@ from __future__ import annotations
 import difflib
 from typing import Any, Dict, List, Sequence
 
-from .base import ToolContext, ToolResult, tool_spec
+from .base import DIFF_CAPTURE_CAP, ToolContext, ToolResult, tool_spec
 
 __all__ = ["build_diff", "diff", "register"]
 
@@ -21,31 +21,35 @@ __all__ = ["build_diff", "diff", "register"]
 def build_diff(changes: Sequence[Dict[str, Any]]) -> str:
     """把本次会话的 changes 渲染成 unified diff 文本。
 
-    每个有 before/after 的变更生成一段 unified diff；新建文件（before=None）视为全量新增；
-    无前后文（超大数据未采集）的只列摘要。
+    渲染规则：
+      · 只有**文件内容类**改动（带 `captured=True`）才生成 diff —— run_command、
+        rollback 这类操作不是文件改动，混进来只会产生误导性的"未生成 diff"噪声。
+      · 新建文件（`before` 为 None 但已采集）显示为全量新增，这是最该被审阅的一类改动。
+      · 内容过大没采集的，只在末尾列个"另有 N 个未生成 diff"，不占正文。
     """
     if not changes:
         return "（本次会话未修改任何文件）"
 
     parts: List[str] = []
+    skipped: List[str] = []
     for c in changes:
+        if not c.get("captured"):
+            # 只把"文件改动但太大没采集"的列出；run_command 等无 path 的操作不提
+            if c.get("path"):
+                skipped.append(c.get("path") or c.get("detail", "?"))
+            continue
+
         kind = c.get("kind", "change")
-        detail = c.get("detail", "")
-        name = c.get("path") or detail
+        name = c.get("path") or c.get("detail", "?")
         before = c.get("before")
         after = c.get("after")
 
-        if before is None and after is None:
-            parts.append(f"[{kind}] {detail}（改动过大，未生成 diff）")
-            continue
         if after is None:
-            parts.append(f"[{kind}] {detail}（无 after 内容，未生成 diff）")
+            parts.append(f"[{kind}] {name}（无改动后内容，未生成 diff）")
             continue
 
-        b_lines = (before or "").splitlines()
-        a_lines = after.splitlines()
         diff = list(difflib.unified_diff(
-            b_lines, a_lines,
+            (before or "").splitlines(), after.splitlines(),
             fromfile=f"a/{name}", tofile=f"b/{name}", lineterm="",
         ))
         if diff:
@@ -53,7 +57,15 @@ def build_diff(changes: Sequence[Dict[str, Any]]) -> str:
         else:
             parts.append(f"[{kind}] {name}（内容无变化）")
 
-    return "\n\n".join(parts) if parts else "（本次会话未修改任何文件）"
+    if not parts and not skipped:
+        return "（本次会话没有产生文件内容的改动）"
+
+    out: List[str] = [f"本次会话共 {len(parts)} 个文件变更："]
+    out.extend(parts)
+    if skipped:
+        out.append(f"另有 {len(skipped)} 个变更内容过大（>{DIFF_CAPTURE_CAP} 字符），"
+                   f"未生成 diff：{'、'.join(skipped)}")
+    return "\n\n".join(out)
 
 
 @tool_spec(

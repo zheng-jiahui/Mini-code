@@ -27,6 +27,10 @@ __all__ = ["ToolContext", "ToolResult", "ToolSpec", "ToolRegistry", "tool_spec"]
 
 ToolHandler = Callable[[Dict[str, Any], "ToolContext"], "ToolResult"]
 
+# 单个文件内容超过这个体量就不再采集 before/after —— 改动本身要常驻会话内存直到
+# 会话结束，放几十 MB 进来会拖垮长任务。超限时 /diff 只列摘要，不生成 diff。
+DIFF_CAPTURE_CAP = 50_000
+
 
 # ----------------------------------------------------------------------------
 # 执行上下文
@@ -52,19 +56,31 @@ class ToolContext:
 
     def record_change(self, kind: str, detail: str, *,
                        before: Optional[str] = None, after: Optional[str] = None,
-                       path: Optional[str] = None) -> None:
+                       path: Optional[str] = None,
+                       captured: Optional[bool] = None) -> None:
         """记录本次会话产生的副作用（用于结尾汇总"改了哪些文件"与生成 diff）。
 
-        before/after 只在两侧都不超大时保存（避免大文件撑爆会话内存），
-        用于 /diff 与 diff 工具生成 unified diff。
+        `before`/`after` 是文件改动前后的完整内容，供 /diff 与 diff 工具生成 unified diff。
+
+        这里有个必须分清的语义陷阱：**`before is None` 有两种含义**——
+          1. 文件原本不存在（新建），diff 应显示为"全量新增"，是最该展示的一类改动；
+          2. 内容没采集（文件过大），此时无法生成 diff。
+        靠 `before is None` 本身区分不了这两者，所以显式记录 `captured` 标记。
+        早期版本正是把两者混为一谈，导致**所有新建文件的 diff 都被误判成"改动过大"**。
         """
-        cap = 50_000
-        keep = before is not None and after is not None and len(before) <= cap and len(after) <= cap
+        too_big = ((after is not None and len(after) > DIFF_CAPTURE_CAP)
+                   or (before is not None and len(before) > DIFF_CAPTURE_CAP))
+        if captured is None:
+            # 非文件类操作（run_command / rollback…）没有 path，天然不参与 diff。
+            # 显式传入 captured 则尊重调用方的判断（例如原文过大没读出内容，
+            # 此时 before="" 会被误读成"文件原本是空的"，必须显式否定）。
+            captured = path is not None and not too_big
         self.session.setdefault("changes", []).append({
             "kind": kind, "detail": detail, "ts": time.time(),
             "path": path,
-            "before": before if keep else None,
-            "after": after if keep else None,
+            "captured": captured,
+            "before": before if captured else None,
+            "after": after if captured else None,
         })
 
 

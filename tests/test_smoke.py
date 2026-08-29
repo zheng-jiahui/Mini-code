@@ -30,7 +30,8 @@ from agent.llm import AssistantMessage, MockBackend  # noqa: E402
 from agent.loop import AgentLoop  # noqa: E402
 from agent.parser import ToolCallParser, extract_text_calls  # noqa: E402
 from agent.tools import build_default_registry, build_tool_context  # noqa: E402
-from agent.tools.base import ToolResult  # noqa: E402
+from agent.tools.base import DIFF_CAPTURE_CAP, ToolResult  # noqa: E402
+from agent.tools.review import build_diff  # noqa: E402
 
 
 # ----------------------------------------------------------------------------
@@ -828,18 +829,101 @@ def test_single_file_rollback_restores_only_named_file():
         assert (Path(task_dir) / "bad.py").read_text(encoding="utf-8") == "print('BROKEN')\n"
 
 
+def test_new_file_change_is_diffable_not_mistaken_for_too_big():
+    """回归：新建文件的 before 本来就是 None，不能被误判成"改动过大"。
+
+    早期 record_change 用 `before is not None and after is not None` 判断能否生成 diff，
+    结果所有新建文件（最该被审阅的一类改动）的 diff 全部丢失。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        backend, profile = _scripted([{"content": "x", "tool_calls": []}])
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+
+        registry.execute("write_file", {"path": "fresh.py", "content": "x = 1\ny = 2\n"}, loop.ctx)
+        changes = loop.ctx.session["changes"]
+        assert len(changes) == 1
+        assert changes[0]["captured"] is True, "新建文件（before=None）也必须可生成 diff"
+        assert changes[0]["before"] is None
+
+        text = build_diff(changes)
+        assert "+x = 1" in text and "+y = 2" in text, "新建文件应显示为全量新增"
+        assert "过大" not in text
+
+
+def test_record_change_marks_command_and_oversize_as_not_captured():
+    """run_command 这类非文件操作不参与 diff；超大文件才标未采集。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        backend, profile = _scripted([{"content": "x", "tool_calls": []}])
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        ctx = loop.ctx
+
+        ctx.record_change("command", "python a.py")                      # 无 path
+        ctx.record_change("write", "big.py", path="big.py",
+                          before=None, after="x" * (DIFF_CAPTURE_CAP + 1))  # 超限
+        ctx.record_change("write", "ok.py", path="ok.py", before=None, after="z = 1\n")
+
+        changes = ctx.session["changes"]
+        assert [c["captured"] for c in changes] == [False, False, True]
+
+        text = build_diff(changes)
+        assert "+z = 1" in text                       # 正常文件照常出 diff
+        assert "big.py" in text                       # 超限的只在末尾提一句
+        assert "python a.py" not in text              # 命令不是文件改动，不该出现在 diff 里
+        assert "另有 1 个变更内容过大" in text
+
+
+def test_write_over_huge_file_marks_change_not_captured():
+    """覆盖写一个超大文件时，不能把 before="" 当成"原本是空文件"。
+
+    否则 diff 会把一次修改显示成全量新增，比不显示更糟。
+    同时验证原文不会被读进会话内存（changes 里不存超大内容）。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        backend, profile = _scripted([{"content": "x", "tool_calls": []}])
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+
+        huge = "Z" * (DIFF_CAPTURE_CAP * 5)          # 远超采集上限
+        r = registry.execute("write_file", {"path": "huge.txt", "content": huge}, loop.ctx)
+        assert r.ok, r.render()
+
+        # 再覆盖写一次（这次原文件已超限）
+        r = registry.execute("write_file", {"path": "huge.txt", "content": "small\n"}, loop.ctx)
+        assert r.ok, r.render()
+        assert "行" in r.render(), "回执仍应报出行数变化"
+
+        change = loop.ctx.session["changes"][-1]
+        assert change["captured"] is False, "原文过大时应显式标记未采集，而非当成空文件"
+        assert change["before"] is None and change["after"] is None
+
+        # diff 里只说"未生成 diff"，不能出现"全量新增"这种误导性内容
+        text = build_diff(loop.ctx.session["changes"])
+        assert "未生成 diff" in text
+        assert "huge.txt" in text
+
+
 def test_build_diff_handles_new_and_unchanged():
     from agent.tools.review import build_diff
     # 新建文件（before=None）应显示为全量新增；内容无变化的标"无变化"
     changes = [
-        {"kind": "write", "detail": "new.py", "path": "new.py", "before": None, "after": "x = 1\n"},
-        {"kind": "edit", "detail": "same.py", "path": "same.py", "before": "y = 1\n", "after": "y = 1\n"},
-        {"kind": "write", "detail": "big.py", "path": "big.py", "before": None, "after": None},  # 超大数据未采集
+        {"kind": "write", "detail": "new.py", "path": "new.py",
+         "captured": True, "before": None, "after": "x = 1\n"},
+        {"kind": "edit", "detail": "same.py", "path": "same.py",
+         "captured": True, "before": "y = 1\n", "after": "y = 1\n"},
+        {"kind": "write", "detail": "big.py", "path": "big.py",
+         "captured": False, "before": None, "after": None},  # 超大数据未采集
     ]
     text = build_diff(changes)
     assert "+x = 1" in text
     assert "内容无变化" in text
-    assert "改动过大" in text or "未生成 diff" in text
+    assert "未生成 diff" in text
+
+    # 空改动 / 全是命令的场景要有得体文案，不能返回空串
+    assert "未修改任何文件" in build_diff([])
+    assert "没有产生文件内容的改动" in build_diff(
+        [{"kind": "command", "detail": "python a.py", "path": None, "captured": False}])
 
 
 # ----------------------------------------------------------------------------

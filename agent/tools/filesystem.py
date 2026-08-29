@@ -19,7 +19,7 @@ from typing import Any, Dict, List
 
 from ..errors import SecurityError, ToolError
 from ..security import truncate_output
-from .base import ToolContext, ToolResult, ToolSpec, tool_spec
+from .base import DIFF_CAPTURE_CAP, ToolContext, ToolResult, ToolSpec, tool_spec
 
 __all__ = ["read_file", "write_file", "edit_block", "list_dir", "register"]
 
@@ -101,6 +101,19 @@ def read_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     )
 
 
+def _count_lines(path: Path) -> int:
+    """流式统计行数：不把整个文件读进内存，用于大文件覆盖写时的回执统计。
+
+    注意：内部辅助函数必须放在 @tool_spec 装饰器**之外**——装饰器紧贴它下面的第一个
+    def，误插到中间会让装饰器挂到辅助函数上，工具就退化成裸函数了。
+    """
+    try:
+        with path.open("rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
 # ----------------------------------------------------------------------------
 # write_file
 # ----------------------------------------------------------------------------
@@ -133,12 +146,18 @@ def write_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     existed = target.exists()
     old_lines = 0
     old_text = ""
+    old_captured = False          # 原文件内容是否真的读到了（过大时放弃，避免撑爆内存）
     backup_path = ""
 
     if existed:
         try:
-            old_text = target.read_text(encoding="utf-8", errors="replace")
-            old_lines = len(old_text.splitlines())
+            # 只在体量可控时才把原文读进内存——覆盖写一个几十 MB 的日志文件时，
+            # 为了生成一份注定超限被丢弃的 diff 而把全文驻留内存不划算。
+            # 行数另行流式统计，保证回执里的「N → M 行」始终准确。
+            if target.stat().st_size <= DIFF_CAPTURE_CAP * 4:   # UTF-8 最多 4 字节/字符
+                old_text = target.read_text(encoding="utf-8", errors="replace")
+                old_captured = True
+            old_lines = _count_lines(target)
         except OSError:
             old_lines = 0
             old_text = ""
@@ -156,9 +175,13 @@ def write_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         raise ToolError(f"写入失败：{exc}", tool="write_file", hint="检查路径是否越界、文件是否被占用或只读。") from exc
 
     new_lines = len(content.splitlines())
+    # 原文没读到（文件过大）时必须显式标 captured=False：
+    # 否则 before="" 会被当成"文件原本是空的"，diff 显示成全量新增，反而误导。
+    content_captured = (not existed) or old_captured
     before_text = old_text if existed else None
-    after_text = (old_text + content) if append else content
-    ctx.record_change("write", _rel(ctx, target), before=before_text, after=after_text, path=_rel(ctx, target))
+    after_text = ((old_text + content) if append else content) if content_captured else content
+    ctx.record_change("write", _rel(ctx, target), before=before_text, after=after_text,
+                      path=_rel(ctx, target), captured=content_captured)
 
     detail = f"{'追加' if append else '写入'} {_rel(ctx, target)}：{old_lines} → {new_lines} 行，{len(content)} 字符"
     if backup_path:
