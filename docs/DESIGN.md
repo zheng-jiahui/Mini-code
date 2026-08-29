@@ -31,7 +31,8 @@ agent/loop.py          主循环（编排者）：调模型→解析→执行工
    ├── agent/llm.py      LLM 接入层（OpenAI SDK / 原生 HTTP / Mock 三种后端）
    ├── agent/history.py  对话历史（OpenAI 格式）+ token 计数 + 自动压缩
    ├── agent/parser.py   模型输出解析（原生 tool_calls / 文本协议 ```json）
-   ├── agent/tools/      工具系统：base（注册表/回执）+ filesystem/search/shell/meta/repair
+   ├── agent/tools/      工具系统：base（注册表/回执）+ filesystem/search/shell/meta/repair/review
+   ├── agent/profile.py    项目画像（识别语言/框架/构建与测试命令，注入 system prompt）
    ├── agent/selfrepair.py  自修复「感知」层（纯函数，可单测）
    ├── agent/security.py 安全层：路径沙箱 / 危险命令 / 输出净化 / 智能压缩
    └── agent/config.py   配置（三层优先级 + 多档位 + 密钥轮换）
@@ -76,6 +77,17 @@ agent/loop.py          主循环（编排者）：调模型→解析→执行工
 模型改过文件却没跑过任何验证命令就 `finish` → 回灌提示逼它先验证（最多拦 2 次）。
 根因：录演示视频最怕"写完即收尾"的半成品。
 
+### 3.6 把模型输出当不可信输入
+模型可能传出一个越界路径、一条危险命令、或一个荒谬的 timeout（如 99999 秒）。
+三者统一按"边界防御"处理：路径走 `PathGuard` 沙箱、命令走黑白名单、数值走区间夹取。
+**不要因为"模型通常是对的"就省掉校验**——一次越界/挂死就会毁掉整场演示。
+
+### 3.7 工具反向文档与"双通道一致性"
+给每个工具写清「什么时候不该用它」。关键在**一致性**：任何注入给模型的信息，
+都必须同时覆盖 native function calling 与文本协议两条通道，否则默认配置下等于没写
+（见 `ToolSpec.effective_description()`）。这也是本项目里反复出现的一类坑：
+**新能力只加在一条通道上，另一条悄悄失效**。
+
 ---
 
 ## 4. 逐版本设计依据
@@ -105,11 +117,44 @@ agent/loop.py          主循环（编排者）：调模型→解析→执行工
 评委必问"长任务怎么不超窗、花了多少"。交付：精确 token（tiktoken）+ 智能压缩（信号行优先）+ `/stats` 真实成本面板。
 修了一处真实 bug：`ToolResult.render` 调用 `smart_compress` 却没 import，任何超长回执都 `NameError`。
 
-### V4（规划）— 可审阅性
-unified diff 预览 + `/diff` 命令 + 单文件级回退。让"改动前能先看到会发生什么"，以及从「第 N 次」快照只恢复某个文件。
+### V4 — 可审阅性
+`record_change` 采集改动前后内容 → `build_diff` 渲染 unified diff → 既是用户的 `/diff` 命令，
+也是模型可调用的 `diff` 工具（finish 前自查）；`rollback(files=[...])` 做单文件级回退。
 
-### V5（规划）— 自主性增强
-plan-then-execute（复杂任务先出计划）、无依赖调用并行（多个 read/grep 一起发）、项目画像（自动识别语言/框架/构建命令注入 system prompt）。
+**实跑才暴露的两个缺陷**（单测全绿，但演示会翻车——说明"实跑验证"这步不能省）：
+1. 所有**新建文件**的 diff 全丢了。根因：`record_change` 用 `before is not None and after is not None`
+   反推"能否生成 diff"，但新建文件的 `before` 本来就该是 None（文件原本不存在）。
+2. `run_command`/`rollback` 这些**操作**被当成**文件改动**渲染，在 diff 正文里刷噪声。
+
+**教训（面试可讲）**：`None` 同时承担了"文件原本不存在"和"内容没采集"两种含义，
+一个 `is not None` 判断不了两件事。修法是引入显式的 `captured` 标记把语义分开。
+
+### V5 — 自主性增强
+- **项目画像**（`profile.py`）：切入任务目录时扫描语言/框架/构建与测试命令，注入 system prompt 的
+  「# 项目画像」段落——让模型"先看清项目再动手"，而不是盲猜该跑什么命令。
+- **plan 工具**：复杂任务先列分步计划写入 session，供用户审阅、也帮模型对齐目标。
+  触发用启发式（描述够长或含"实现/重构/搭建"等词），不是所有任务都强制。
+- **只读工具并行**：一轮里的 `read_file`/`list_dir`/`grep_search`/`find_files`/`diff` 用线程池并发，
+  回执按原顺序写回；有副作用的写与命令仍严格顺序执行。
+
+**设计要点**：并行只放"只读"工具。写操作与命令一旦并行，顺序不确定会让结果不可复现，
+也会让"回滚到哪一步"变得说不清——并发的收益远不抵确定性丢失。
+
+### 追加工作（V4/V5 之后的打磨）
+
+- **工具反向文档** `when_not_to_use`：工具描述普遍只写"能干什么"，但 agent 出错往往出在
+  "该用 A 却用了 B"。关键决策是**必须让模型在两条通道上都看到**——默认走 native function calling，
+  模型读的是 `openai_schema` 的 description，只写进系统提示词等于没写，故统一走
+  `ToolSpec.effective_description()`。代价明算：系统提示词 +1259 字符（约 +1k tokens），
+  换少一次工具误用（一次误用 = 一整轮重试 + 一次 API 往返），划算；并保留 `with_guardrail=False` 退路。
+- **命令 timeout 上限夹取**：原先直接用模型传的值、无上限，传 99999 会把会话挂死几小时。
+  现在夹到 [1, 300s]。本质是"把模型的输出当不可信输入处理"，与路径沙箱同类。
+- **明确不做命令自动重试**：shell 命令可能有副作用（装依赖/写文件），重试 ≠ 重放，
+  重复执行会造成重复副作用。所以只把诊断与建议讲清楚，是否重试交给模型。
+  ——"没做的东西"也是设计，写进注释免得以后有人来加。
+- **测试命令识别多语言**：补 Java（Maven/Gradle），wrapper 调用分平台
+  （Windows 走 cmd.exe，`./mvnw` 跑不通，必须用 `mvnw.cmd`）；
+  并修了探测链在缺 `[tool.pytest]` 的 `pyproject.toml` 上 `return None`（应为 `continue`）的提前终止 bug。
 
 ---
 
@@ -123,3 +168,16 @@ plan-then-execute（复杂任务先出计划）、无依赖调用并行（多个
 - **"模型改完不验证就收尾？"** V1 假完成拦截，回灌提示逼它先 run_command 验证。
 - **"跑挂了怎么定位？"** V2 自修复：识别测试命令、解析 traceback 并把出错行附近源码直接回灌，省掉模型多一轮 read_file；修不好可 rollback。
 - **"成本如何？"** V3 `/stats`：真实 token（API usage）、耗时、各工具耗时占比一目了然。
+- **"你怎么知道它改了什么？"** V4 可审阅性：`/diff` 出 unified diff，模型自己也能调 `diff`
+  在 finish 前自查；改坏了可以 `rollback(files=[...])` 只回退那一个文件。
+- **"模型乱用工具怎么办？"** 三层：① 每个工具写清"不该用它"的场景（且两条通道都注入）；
+  ② 工具回执里给出可行动的下一步，而不只是报错（如超时时会建议缩小范围并给出 timeout 上限）；
+  ③ 边界防御（3.6）。
+- **"换个语言的项目它还行吗？"** 会先做项目画像（`profile.py`）识别语言/框架/测试命令，
+  测试命令识别覆盖 Python/Go/Rust/Node/Java(Maven/Gradle)，构建工具优先用仓库自带 wrapper
+  并区分平台（Windows 用 `mvnw.cmd`）。
+- **"工具调用会不会互相打架？"** 有副作用的（写文件、跑命令）严格顺序执行；
+  只有只读工具（read/grep/list/diff）才并发，且回执按原顺序写回，保证结果可复现。
+- **"这么多次迭代，最有价值的教训是什么？"** 两个：① 单测全绿 ≠ 能演示——V4 的两个缺陷
+  都是实跑才暴露的；② 一个值承担两种含义迟早出事（`None` 既是"文件不存在"又是"没采集"、
+  `subprocess` 的 `read(n)` 既是"凑满"又是"读到即返回"）。
