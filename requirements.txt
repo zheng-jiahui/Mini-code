@@ -1,0 +1,8 @@
+# 核心依赖（全部为“模型 API 客户端 / 通用库”，不含任何 Agent 框架）
+openai>=1.40.0        # OpenAI 兼容接口客户端（可用 requests 后端替代）
+requests>=2.31.0      # 备选后端：自行拼 HTTP 请求
+PyYAML>=6.0           # 解析 config.yaml（也可用 JSON 配置，见 config.py）
+tiktoken>=0.7.0       # 可选：精确统计 token；未安装时自动降级为启发式估算
+
+# 开发/测试（可选）
+pytest>=8.0

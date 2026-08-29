@@ -1,0 +1,48 @@
+# =============================================================
+#  MiniCode 配置模板（可安全提交到仓库）
+#  使用方式：cp config.example.yaml config.yaml，然后填入自己的凭据。
+#  config.yaml 已在 .gitignore 中；也可以完全不改它，只用环境变量。
+# =============================================================
+
+active_profile: default
+
+profiles:
+  default:
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"     # 从环境变量读取；也可直接写成 "sk-xxx"（不推荐）
+    model: "gpt-4o-mini"
+    temperature: 0.2
+    max_tokens: 4096
+    timeout: 120
+    native_tools: true               # 不支持 function calling 的模型请设为 false
+
+  deepseek:
+    base_url: "https://api.deepseek.com"
+    api_key: "${DEEPSEEK_API_KEY}"
+    model: "deepseek-chat"
+    temperature: 0.2
+    max_tokens: 8192
+    timeout: 180
+    native_tools: true
+
+agent:
+  workspace: "."
+  max_steps: 60
+  max_steps_without_progress: 8
+  max_consecutive_errors: 4
+  max_parse_retries: 2
+  command_timeout: 120
+  max_tool_output_chars: 12000
+  max_file_read_chars: 40000
+  max_context_tokens: 96000
+  reserve_tokens: 4000
+  compact_keep_recent: 8
+  auto_compact: true
+  compact_threshold: 0.75
+  restrict_to_workspace: true
+  command_policy: confirm            # allow | confirm | deny
+  backup_on_write: true
+  stream: false
+  session_log: ".agent_sessions"
+
+dangerous_commands: []               # 留空则使用 security.py 内置黑名单

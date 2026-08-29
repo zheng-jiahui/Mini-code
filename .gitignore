@@ -1,0 +1,25 @@
+# ---- 凭据与本地配置（务必不入库）----
+config.yaml
+config.yml
+config.local.yaml
+config.local.json
+.env
+.env.*
+*.key
+*.pem
+
+# ---- 运行时产物 ----
+.agent_backups/
+.agent_sessions/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# ---- Agent 自己产生的垃圾 ----
+scratch/
+tmp/
+.DS_Store
+Thumbs.db
