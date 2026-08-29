@@ -104,6 +104,7 @@ class AgentConfig:
     auto_compact: bool = True
     compact_threshold: float = 0.75
     compact_include_workspace: bool = True  # 压缩后重新扫描工作区，把"现在有什么"回灌给模型
+    auto_checkpoint: bool = True    # 每个任务结束（含中断/报错）时保存会话检查点，供 --resume 续跑
 
     # V5 自主性：只读工具并行、复杂任务先计划
     parallel_tools: bool = True        # 把一轮里的多个只读调用（read/grep/list/diff）并行发出

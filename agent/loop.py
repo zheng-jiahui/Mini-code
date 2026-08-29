@@ -125,6 +125,7 @@ class RunResult:
     error_message: str = ""
     task_dir: str = ""            # 任务目录：workplace/{任务名}/，始终是最新的
     backup_dir: str = ""          # 本次快照：.agent_backups/{任务名}_{时间戳}_{第N次}/
+    checkpoint: str = ""          # 会话检查点：可用于下次 --resume 续跑
 
     @property
     def succeeded(self) -> bool:
@@ -181,6 +182,7 @@ class AgentLoop:
         self.workspace_root: Path = Path(str(root)).expanduser().resolve()
         self._task_dir: Optional[Path] = None
         self._task_name: Optional[str] = None
+        self.last_task: str = ""     # 最近一次任务描述（检查点恢复时用于重建任务目录）
 
         self._fingerprints: Deque[str] = deque(maxlen=6)
         self._stale_steps = 0
@@ -334,6 +336,7 @@ class AgentLoop:
         """
         started = time.time()
         result = RunResult()
+        self.last_task = task
         # 每个任务一个独立子目录：首次进入时创建，同会话后续追问沿用
         result.task_dir = str(self.prepare_task_dir(task))
         # 每个任务清零"本次会话的副作用"与假完成拦截计数，保证语义是"本任务"而非跨任务累积
@@ -382,6 +385,11 @@ class AgentLoop:
             result.usage = dict(self._usage)
             result.compacted = self.history.compact_count
             self._save_session(result)
+            # 检查点写在 finally 里：Ctrl-C 中断、模型报错、预算耗尽都会走到这里，
+            # 而恰恰是这些非正常结束的场景才最需要"下次接着跑"。
+            ckpt = self.save_checkpoint()
+            if ckpt is not None:
+                result.checkpoint = str(ckpt)
             # 本次任务改过文件 → 归档一份完整快照到 .agent_backups/
             try:
                 snap = self.snapshot_to_backups()
@@ -775,7 +783,7 @@ class AgentLoop:
             self.console.info(f"压缩完成，当前 {self.history.tokens} tokens")
         return True
 
-    def _workspace_state_note(self) -> str:
+    def _workspace_state_note(self, reason: str = "压缩后") -> str:
         """压缩后把「工作区现在有什么」重新告诉模型。
 
         摘要回答的是"做过什么"，答不了"磁盘上现在是什么样"。压缩之后模型若凭记忆
@@ -789,7 +797,7 @@ class AgentLoop:
             entries = list_workspace_files(root)
         except OSError:
             return ""
-        return format_workspace_state(entries)
+        return format_workspace_state(entries, reason=reason)
 
     def _check_stagnation(self) -> bool:
         """检测"原地打转"：最近 3 次调用完全相同，或连续多步无新变更。"""
@@ -872,6 +880,34 @@ class AgentLoop:
                 self.on_event(event, payload)
             except Exception:  # noqa: BLE001 —— 回调不能影响主流程
                 pass
+
+    # ------------------------------------------------------------------
+    # 会话检查点（跨进程续跑）
+    # ------------------------------------------------------------------
+    def save_checkpoint(self, *, path=None):
+        """保存会话检查点，返回路径；未启用或历史为空时返回 None。
+
+        存什么、不存什么的依据见 `agent/checkpoint.py` 的模块 docstring：
+        只存"发生过什么"（历史 / 事实 / 任务名 / 统计），
+        不存"当前是什么样"（system 提示词 / 项目画像 / 客户端）——后者依赖
+        当前代码与工作区，恢复时必须重建，存旧的反而会与现状不符。
+        """
+        from .checkpoint import save as _save
+
+        return _save(self, path=path)
+
+    def resume_checkpoint(self, path=None) -> int:
+        """从检查点恢复，返回恢复的历史条数；无可用检查点时返回 0。
+
+        损坏的检查点**抛出 ValueError 而不静默吞掉**：用户必须知道它是"坏了"
+        而不是"没有"——前者的处置是删掉重来，后者是正常开新任务，混为一谈会误导。
+        """
+        from .checkpoint import apply as _apply, latest as _latest, load as _load
+
+        target = Path(str(path)) if path else _latest(self)
+        if target is None or not Path(target).exists():
+            return 0
+        return _apply(self, _load(Path(target)))
 
     def _save_session(self, result: RunResult) -> None:
         """会话落盘（JSONL），便于复盘与答辩演示。"""

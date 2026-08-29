@@ -40,6 +40,8 @@ BANNER_HELP = """\
   /new [任务名]      切换到另一个任务；同名任务沿用 workplace 下已有目录
   /dir               显示当前任务名与目录
   /save [路径]       把当前对话导出为 JSONL
+  /checkpoint        手动保存会话检查点（下次可用 --resume 续跑）
+  /resume [路径]     从检查点恢复会话（默认取最近一次）
   !<命令>            直接执行 shell 命令（不经过模型）
 其余内容作为自然语言任务发送给智能体。
 """
@@ -92,6 +94,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--list-tools", action="store_true", help="列出所有工具后退出")
     p.add_argument("--list-profiles", action="store_true", help="列出配置中的模型档位后退出")
     p.add_argument("--print-prompt", action="store_true", help="打印完整 System Prompt 后退出")
+    p.add_argument("--resume", action="store_true",
+                   help="从上次保存的会话检查点恢复后再开始（默认取最近一次）")
     p.add_argument("-q", "--quiet", action="store_true", help="精简输出")
     p.add_argument("--no-color", action="store_true", help="关闭彩色输出")
     p.add_argument("-v", "--version", action="version", version=f"MiniCode {__version__}")
@@ -164,6 +168,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     if backend_kind == "mock":
         console.warn("离线演示模式：不会发送任何网络请求，模型回复来自内置脚本。")
 
+    # ---- 恢复上次会话（仅显式要求时）----
+    if args.resume:
+        n = _do_resume(loop, console, None)
+        if n:
+            console.info(f"已从检查点恢复 {n} 条历史，当前任务「{loop.task_name}」→ {loop.task_dir}")
+        else:
+            console.warn("没有找到可恢复的检查点，将作为新会话开始。")
+    elif not args.task:
+        _hint_checkpoint(loop, console)
+
     # ---- 单次任务 ----
     if args.task:
         # 先定好目录再跑，用户等待时就知道产物会落在哪
@@ -173,6 +187,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         console.final(result.answer)
         if result.backup_dir:
             console.info(f"已归档备份：{result.backup_dir}")
+        if result.checkpoint:
+            console.info(f"会话检查点：{result.checkpoint}（下次 --resume 可续跑）")
         console.stats({"步数": result.steps, "工具调用": result.tool_calls,
                        "失败": result.errors, "耗时": f"{result.elapsed:.1f}s",
                        "结束原因": result.finish_reason})
@@ -180,6 +196,46 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ---- REPL ----
     return _repl(loop, console)
+
+
+def _do_resume(loop: AgentLoop, console: Console, path=None) -> int:
+    """从检查点恢复，返回恢复的历史条数；没有可用检查点时返回 0。
+
+    检查点**损坏**时报 error 而不是静默失败：用户必须能分清
+    "没有可恢复的会话"与"有、但坏了"——前者正常开新任务，后者要删掉坏文件。
+    """
+    from . import checkpoint as _ck
+
+    target = Path(str(path)) if path else _ck.latest(loop)
+    if target is None or not Path(target).exists():
+        return 0
+    try:
+        state = _ck.load(Path(target))
+    except ValueError as exc:
+        console.error(f"恢复失败（检查点已损坏）：{exc}")
+        console.echo(f"  位置：{target}\n  删除该文件即可恢复正常启动。")
+        return 0
+    console.info(f"检查点：{_ck.describe(state)}")
+    return loop.resume_checkpoint(target)
+
+
+def _hint_checkpoint(loop: AgentLoop, console: Console) -> None:
+    """启动时提示存在可恢复的会话，但**不自动恢复**。
+
+    为什么不自动恢复：恢复会改变模型看到的上下文，而用户此刻可能只是想开个新任务。
+    自动做的事必须没有歧义，"接着上次继续"显然有歧义——所以只提示，不代劳。
+    """
+    from . import checkpoint as _ck
+
+    try:
+        p = _ck.latest(loop)
+        if p is None:
+            return
+        state = _ck.load(p)
+    except (OSError, ValueError):
+        return                      # 启动提示不该因为一个坏检查点而崩掉
+    text = f"  发现上次的会话检查点：{_ck.describe(state)}；加 --resume 可继续。"
+    console.echo(console._c(text, "\033[90m") if console.color else text)
 
 
 def _repl(loop: AgentLoop, console: Console) -> int:
@@ -236,6 +292,16 @@ def _repl(loop: AgentLoop, console: Console) -> int:
                 console.info(f"已开启新任务「{loop.task_name}」→ {d}")
             elif cmd == "/dir":
                 console.info(f"当前任务「{loop.task_name or '尚未开始'}」→ {loop.task_dir or '—'}")
+            elif cmd == "/checkpoint":
+                p = loop.save_checkpoint()
+                console.info(f"已保存检查点：{p}" if p else "没有可保存的内容（会话为空或未启用检查点）。")
+            elif cmd == "/resume":
+                parts = raw.split(maxsplit=1)
+                n = _do_resume(loop, console, parts[1] if len(parts) > 1 else None)
+                if n:
+                    console.info(f"已恢复 {n} 条历史，当前任务「{loop.task_name}」→ {loop.task_dir}")
+                else:
+                    console.warn("没有可用的检查点。")
             elif cmd == "/save":
                 parts = raw.split(maxsplit=1)
                 path = parts[1] if len(parts) > 1 else "session.jsonl"

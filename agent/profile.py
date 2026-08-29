@@ -164,7 +164,7 @@ def list_workspace_files(workspace, max_files: int = _MAX_STATE_FILES) -> List[D
     return entries
 
 
-def format_workspace_state(entries: List[Dict[str, Any]]) -> str:
+def format_workspace_state(entries: List[Dict[str, Any]], reason: str = "压缩后") -> str:
     """把工作区状态渲染成注入给模型的提示。空工作区返回空串。
 
     这里**刻意不含文件内容**：一是体积会失控，二是"列清单"与"读内容"是两件事。
@@ -174,7 +174,7 @@ def format_workspace_state(entries: List[Dict[str, Any]]) -> str:
     if not entries:
         return ""
     shown = [e for e in entries if not e.get("more")]
-    lines = [f"{WORKSPACE_STATE_MARKER}以下是压缩后**重新扫描磁盘**得到的真实文件清单"
+    lines = [f"{WORKSPACE_STATE_MARKER}以下是{reason}**重新扫描磁盘**得到的真实文件清单"
              f"（{len(shown)} 个文件，只列路径与行数，不含内容）："]
     for e in entries:
         if e.get("more"):
@@ -185,7 +185,7 @@ def format_workspace_state(entries: List[Dict[str, Any]]) -> str:
                                         else f"\u2014 {_human_bytes(e.get('size') or 0)}"))
     lines.append(
         "注意：上面没有文件内容。要用 edit_block 精确修改某个文件时，请先用 read_file 读取"
-        "当前内容，不要凭记忆写 old_text\u2014\u2014旧内容可能已在压缩中被丢弃，凭记忆写必然对不上。"
+        "当前内容，不要凭记忆写 old_text\u2014\u2014旧内容可能已不在当前上下文中，凭记忆写必然对不上。"
     )
     return "\n".join(lines)
 

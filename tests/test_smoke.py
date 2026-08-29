@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import re
 import sys
@@ -25,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from agent.checkpoint import checkpoint_dir, load as load_checkpoint  # noqa: E402
 from agent.config import AgentConfig, LLMProfile, load_config  # noqa: E402
 from agent.history import MAX_FACTS_CHARS, History  # noqa: E402
 from agent.llm import AssistantMessage, MockBackend  # noqa: E402
@@ -1662,6 +1665,158 @@ def test_repeated_compaction_does_not_stack_stale_workspace_listings():
                 if isinstance(m.get("content"), str)
                 and m["content"].startswith(WORKSPACE_STATE_MARKER)]
         assert len(hits) == 1, f"工作区清单应只留最新一份，实际 {len(hits)} 份"
+
+
+# ----------------------------------------------------------------------------
+# 会话检查点（跨进程续跑）
+# ----------------------------------------------------------------------------
+@contextlib.contextmanager
+def _raises(exc_type):
+    """断言"确实抛出了指定异常"的小工具（测试 runner 没有 pytest.raises）。"""
+    try:
+        yield
+    except exc_type:
+        return
+    except Exception as exc:  # noqa: BLE001
+        raise AssertionError(f"期望 {exc_type.__name__}，实际 {type(exc).__name__}: {exc}") from exc
+    raise AssertionError(f"期望抛出 {exc_type.__name__}，但没有抛出")
+
+
+def _run_then_new_loop(tmp, script, task="跑个任务", prepare=None):
+    """用 script 跑一次任务并保存检查点，再返回一个全新的 loop（模拟进程重启）。
+
+    prepare(loop) 在 save 之前调用，用于设置"应当被持久化"的状态——
+    放在 save 之后设就测不到持久化了。
+    """
+    cfg, profile, registry, _ = _make_env(tmp)
+    backend, profile = _scripted(script, native=True)
+    loop = AgentLoop(cfg, profile, backend, registry, console=None)
+    loop.run(task)
+    if prepare:
+        prepare(loop)
+    path = loop.save_checkpoint()
+    assert path is not None and Path(path).exists(), "跑过任务后必须产出检查点"
+    backend2, profile2 = _scripted([], native=True)
+    loop2 = AgentLoop(cfg, profile2, backend2, registry, console=None)
+    return loop, loop2, path
+
+
+def test_checkpoint_roundtrip_restores_history_facts_and_task():
+    """往返检查点：历史 / 事实 / 任务名能恢复。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        script = [
+            {"content": "写文件。", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "a.py", "content": "x = 1\n"}}]},
+            {"content": "跑一下。", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "python a.py"}}]},
+            {"content": "完成。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "done"}}]},
+        ]
+        def _set_facts(lp):
+            lp.history.facts = "- 硬约束：不要改 config.yaml"
+
+        loop, loop2, path = _run_then_new_loop(tmp, script, task="创建脚本并运行",
+                                               prepare=_set_facts)
+        n = loop2.resume_checkpoint(path)
+        assert n > 0
+        assert loop2.task_name == loop.task_name, "任务名必须恢复，否则代码会落到另一个目录"
+        assert loop2.history.facts == "- 硬约束：不要改 config.yaml", "事实块必须随检查点恢复"
+        # system 提示词不入库，恢复时按当前代码与工作区重建
+        assert loop2.history.messages[0]["role"] == "system"
+        assert loop2.history.messages[0]["content"] == loop2.system_prompt
+
+
+def test_checkpoint_keeps_cost_accounting_continuous():
+    """成本对账必须跨进程连续，否则恢复后 /stats 会从零开始，账就断了。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        script = [
+            {"content": "跑一下", "tool_calls": [
+                {"name": "run_command", "arguments": {"command": "echo hi"}}]},
+            {"content": "完成", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "ok"}}]},
+        ]
+        loop, loop2, path = _run_then_new_loop(tmp, script, task="跑个命令")
+        before_total = loop._usage.get("total_tokens", 0)
+        assert before_total > 0
+
+        loop2.resume_checkpoint(path)
+        assert loop2._usage.get("total_tokens", 0) == before_total, "token 账目恢复后必须接上"
+        assert loop2._total_tool_calls == loop._total_tool_calls
+        assert loop2._model_calls == loop._model_calls
+
+
+def test_resume_warns_the_model_the_history_is_not_fresh():
+    """恢复后必须如实告知模型"这是历史记录、不是你刚做过的"。
+
+    不提醒的话，模型会以为自己刚执行过历史里的操作，于是跳过本该做的验证，
+    或者重复执行一遍。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        script = [
+            {"content": "写文件。", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "a.py", "content": "x = 1\n"}}]},
+            {"content": "完成。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "done"}}]},
+        ]
+        _, loop2, path = _run_then_new_loop(tmp, script, task="创建 a.py")
+        loop2.resume_checkpoint(path)
+
+        blob = "\n".join(str(m.get("content") or "") for m in loop2.history.messages)
+        assert "恢复的会话" in blob
+        assert "不代表你刚刚执行过" in blob, "必须提醒模型：历史 ≠ 刚做过"
+        assert "工作区当前状态" in blob, "恢复后同样要补一份工作区真实清单（与压缩后同理）"
+
+
+def test_corrupt_checkpoint_raises_instead_of_being_ignored():
+    """损坏的检查点必须报错，不能被当成"没有检查点"——两者处置完全不同。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        backend, profile = _scripted([], native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+
+        d = checkpoint_dir(loop)
+        d.mkdir(parents=True, exist_ok=True)
+
+        truncated = d / "truncated.json"
+        truncated.write_text('{"version": 1, "messages": [{"role": "user"', encoding="utf-8")
+        with _raises(ValueError):
+            load_checkpoint(truncated)
+
+        future = d / "future.json"
+        future.write_text(json.dumps({"version": 99, "messages": [], "kinds": []}), encoding="utf-8")
+        with _raises(ValueError):
+            load_checkpoint(future)
+
+        mismatched = d / "mismatch.json"
+        mismatched.write_text(
+            json.dumps({"version": 1, "messages": [{"role": "user", "content": "hi"}], "kinds": []}),
+            encoding="utf-8")
+        with _raises(ValueError):
+            load_checkpoint(mismatched)
+
+
+def test_empty_session_is_not_checkpointed():
+    """空会话没有恢复价值，不该留下一个空文件（还会让启动提示变噪音）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        backend, profile = _scripted([], native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        assert loop.save_checkpoint() is None
+
+
+def test_checkpoint_file_is_valid_json_with_no_temp_leftover():
+    """原子写：落地的必须是完整 JSON，且不留 .tmp 残留。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        script = [{"content": "完成", "tool_calls": [
+            {"name": "finish", "arguments": {"summary": "ok"}}]}]
+        _, _, path = _run_then_new_loop(tmp, script, task="最小任务")
+        path = Path(path)
+        assert path.suffix == ".json"
+        assert not path.with_name(path.name + ".tmp").exists(), "原子写不应留下临时文件"
+        state = json.loads(path.read_text(encoding="utf-8"))
+        assert state["version"] == 1
+        assert isinstance(state["messages"], list)
+
 
 
 # ----------------------------------------------------------------------------
