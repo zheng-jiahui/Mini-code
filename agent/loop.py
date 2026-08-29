@@ -67,7 +67,8 @@ from .history import History
 from .llm import AssistantMessage, LLMBackend, ToolCall
 from .parser import ToolCallParser
 from .prompts import BUDGET_WARNING, NO_PROGRESS_HINT, build_system_prompt, build_task_message
-from .profile import detect_project_profile, format_project_profile, looks_like_complex_task
+from .profile import (WORKSPACE_STATE_MARKER, detect_project_profile, format_project_profile,
+                      format_workspace_state, list_workspace_files, looks_like_complex_task)
 from .tools import build_tool_context
 from .tools.base import ToolContext, ToolRegistry, ToolResult
 from .tools.meta import FINISH_SENTINEL
@@ -705,22 +706,90 @@ class AgentLoop:
     # ------------------------------------------------------------------
     def _maybe_compact(self) -> None:
         """超预算时压缩历史。"""
-        budget = int(self.config.max_context_tokens) - int(self.config.reserve_tokens)
         if not self.config.auto_compact:
             return
+        budget = int(self.config.max_context_tokens) - int(self.config.reserve_tokens)
         if not self.history.needs_compaction(budget, float(self.config.compact_threshold)):
             return
+        self.compact_context(budget)
+
+    def compact_context(self, budget: Optional[int] = None) -> bool:
+        """压缩上下文，并在压缩后补齐「常驻事实 + 工作区当前状态」。
+
+        自动压缩与手动 /compact **走同一条路径**：两者之后模型同样面临
+        "旧文件内容已被压掉、凭记忆编辑必然对不上"的问题，
+        让两条路径行为不一致本身就是 bug 温床。
+
+        Returns:
+            是否真的压缩了。
+        """
+        if budget is None:
+            budget = int(self.config.max_context_tokens) - int(self.config.reserve_tokens)
         if self.console:
-            self.console.info(f"上下文 {self.history.tokens}/{budget} tokens，触发自动压缩…")
+            self.console.info(f"上下文 {self.history.tokens}/{budget} tokens，正在压缩…")
         ok = self.history.compact(
             llm=self.backend,
             keep_recent=int(self.config.compact_keep_recent),
             budget=budget,
         )
-        if ok:
-            self.history.add_note("（上下文已压缩，请基于摘要继续工作，不要重复已完成的操作。）")
-            if self.console:
-                self.console.info(f"压缩完成，当前 {self.history.tokens} tokens")
+        if not ok:
+            return False
+        self.history.add_note("（上下文已压缩，请基于摘要继续工作，不要重复已完成的操作。）")
+
+        # 摘要压缩存在"最小体积"：system 提示词 + 事实块 + 摘要 + 工作区清单 + 最近 N 条。
+        # 预算小于这个下限时，压完仍然超阈值，下一步就再压一次——每步多花一次模型
+        # 调用却什么都没省下来（实测 5073 → 5178，反而变大）。
+        # 此时退化为硬压缩：直接丢弃更早的历史，且**不调模型**，便宜且一定能降下来。
+        threshold = float(self.config.compact_threshold)
+        keep_recent = int(self.config.compact_keep_recent)
+        # 保留下限设为配置值的一半：硬压缩的目的是砍掉**更早**的历史，
+        # 不是把最近的上下文也一并砍光。实测降到 2 时模型会彻底失去线索，
+        # 转头去重新 read_file 找状态——省下的 token 又用更多轮次花出去了。
+        floor = max(2, keep_recent // 2)
+        shrinks = 0
+        while self.history.tokens >= budget * threshold and shrinks < 4:
+            shrinks += 1
+            if not self.history.compact(llm=None,
+                                        keep_recent=max(floor, keep_recent - 2 * shrinks),
+                                        budget=budget):
+                break
+        if shrinks and self.console:
+            self.console.warn(f"摘要压缩后仍超预算，已追加 {shrinks} 次硬压缩（丢弃更早历史）")
+        # 压到下限仍超预算，说明预算本身小于"system 提示词 + 事实 + 摘要"的最小体积，
+        # 再压只会把有用的近期上下文也丢光。此时如实告诉用户该调哪个旋钮。
+        if self.history.tokens >= budget * threshold and self.console:
+            self.console.warn(
+                f"压缩后仍有 {self.history.tokens} tokens，超过预算 {budget} 的 {threshold:.0%}："
+                "当前 agent.max_context_tokens 对本次任务偏小（光 system 提示词就占了很大一块）。"
+                "建议调大 max_context_tokens，或调低 compact_threshold 让它更早开始压缩。"
+            )
+
+        # 工作区状态放在最后注入：上面的硬压缩可能把刚注入的清单又丢进中间段，
+        # 而它是"可重建的事实"，最后补一份最新的即可，不需要跟着历史一起被压。
+        state = self._workspace_state_note()
+        if state:
+            self.history.drop_notes(WORKSPACE_STATE_MARKER)
+            self.history.add_note(state)
+
+        if self.console:
+            self.console.info(f"压缩完成，当前 {self.history.tokens} tokens")
+        return True
+
+    def _workspace_state_note(self) -> str:
+        """压缩后把「工作区现在有什么」重新告诉模型。
+
+        摘要回答的是"做过什么"，答不了"磁盘上现在是什么样"。压缩之后模型若凭记忆
+        去 edit_block，old_text 几乎必然对不上（旧文件内容早被压掉了），白费一整轮。
+        而工作区状态是**可重建的事实**——重新扫一遍目录即可，不必占用摘要的额度。
+        """
+        if not getattr(self.config, "compact_include_workspace", True):
+            return ""
+        root = self._task_dir or self.workspace_root
+        try:
+            entries = list_workspace_files(root)
+        except OSError:
+            return ""
+        return format_workspace_state(entries)
 
     def _check_stagnation(self) -> bool:
         """检测"原地打转"：最近 3 次调用完全相同，或连续多步无新变更。"""
@@ -758,6 +827,9 @@ class AgentLoop:
                  f"  会话耗时：{time.time() - self._session_started:.1f}s",
                  f"  工具调用总数：{self._total_tool_calls}    模型调用次数：{self._model_calls}",
                  f"  上下文压缩次数：{self.history.compact_count}    回执智能压缩次数：{self._output_compressions}"]
+        if self.history.facts:
+            lines.append(f"  常驻事实块：{len(self.history.facts.splitlines())} 条"
+                         "（压缩时不参与再摘要，因此不会逐轮衰减）")
 
         # 时间去向：回答"瓶颈在哪"。原先只统计工具耗时，而等模型通常是最大的一块，
         # 不把它算进来，这个面板就答不出"时间花在哪"——只能看到局部。

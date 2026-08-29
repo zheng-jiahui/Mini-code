@@ -9,12 +9,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List
 
 from .selfrepair import detect_test_command
 
-__all__ = ["detect_project_profile", "format_project_profile", "looks_like_complex_task"]
+__all__ = ["detect_project_profile", "format_project_profile", "looks_like_complex_task",
+           "list_workspace_files", "format_workspace_state", "WORKSPACE_STATE_MARKER"]
 
 _LANG_MARKERS = [
     ("requirements.txt", "Python"),
@@ -104,6 +106,96 @@ def format_project_profile(profile: Dict[str, Any]) -> str:
     else:
         lines.append("- 测试命令：未在仓库中发现标准测试配置；如任务需要测试，请先按项目约定建立。")
     return "\n".join(lines)
+
+
+# ---- 工作区状态扫描（压缩后重建"磁盘上现在有什么"）----
+# 与 filesystem._IGNORE_DIRS 保持同一口径，免得"列目录"和"扫状态"漏掉不同的东西。
+_IGNORE_FOR_STATE = {
+    ".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".idea", ".vscode",
+    ".agent_backups", ".agent_sessions", "dist", "build", ".next", "coverage",
+}
+_MAX_STATE_FILES = 30
+# 清单的起始标记：压缩后要能认出"上一次注入的那份"并删掉，只留最新。
+WORKSPACE_STATE_MARKER = "【工作区当前状态】"
+# 数行必须把文件读进来；超过这个体量就只报大小。一个几十 MB 的日志/数据集，
+# 不该让"重建工作区状态"这件事本身变成负担。
+_MAX_LINE_COUNT_BYTES = 512 * 1024
+
+
+def list_workspace_files(workspace, max_files: int = _MAX_STATE_FILES) -> List[Dict[str, Any]]:
+    """扫一遍工作区，返回 [{"path": 相对路径, "lines": 行数或 None, "size": 字节}]。
+
+    遍历时用 os.walk 并**原地剪掉噪声目录**，而不是 rglob 之后再过滤——
+    后者会先把 node_modules 整个走一遍才丢弃，长任务里这是白花的时间。
+    """
+    ws = Path(workspace)
+    if not ws.is_dir():
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(ws):
+        dirnames[:] = [d for d in dirnames if d not in _IGNORE_FOR_STATE]
+        for name in filenames:
+            p = Path(dirpath) / name
+            try:
+                rel = p.relative_to(ws).as_posix()
+                size = p.stat().st_size
+            except (ValueError, OSError):
+                continue
+            if len(entries) >= max_files:
+                truncated = True
+                break
+            lines = None
+            if size <= _MAX_LINE_COUNT_BYTES:
+                try:
+                    with p.open("rb") as f:
+                        lines = sum(1 for _ in f)
+                except OSError:
+                    lines = None
+            entries.append({"path": rel, "lines": lines, "size": size})
+        if truncated:
+            break
+
+    entries.sort(key=lambda e: e["path"].lower())
+    if truncated:
+        entries.append({"path": "\u2026", "lines": None, "size": 0, "more": True})
+    return entries
+
+
+def format_workspace_state(entries: List[Dict[str, Any]]) -> str:
+    """把工作区状态渲染成注入给模型的提示。空工作区返回空串。
+
+    这里**刻意不含文件内容**：一是体积会失控，二是"列清单"与"读内容"是两件事。
+    清单的作用是让模型知道磁盘上现在有什么、别去编辑一个不存在的文件；
+    内容仍然要它用 read_file 现读——否则它拿压缩前的旧记忆去写 old_text，必然对不上。
+    """
+    if not entries:
+        return ""
+    shown = [e for e in entries if not e.get("more")]
+    lines = [f"{WORKSPACE_STATE_MARKER}以下是压缩后**重新扫描磁盘**得到的真实文件清单"
+             f"（{len(shown)} 个文件，只列路径与行数，不含内容）："]
+    for e in entries:
+        if e.get("more"):
+            lines.append("  \u2026（文件更多，已省略；需要时用 list_dir / find_files 查看）")
+            continue
+        n = e.get("lines")
+        lines.append(f"  {e['path']}" + (f"\u2014 {n} 行" if n is not None
+                                        else f"\u2014 {_human_bytes(e.get('size') or 0)}"))
+    lines.append(
+        "注意：上面没有文件内容。要用 edit_block 精确修改某个文件时，请先用 read_file 读取"
+        "当前内容，不要凭记忆写 old_text\u2014\u2014旧内容可能已在压缩中被丢弃，凭记忆写必然对不上。"
+    )
+    return "\n".join(lines)
+
+
+def _human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}B" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}GB"
 
 
 def looks_like_complex_task(task: str) -> bool:

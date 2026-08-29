@@ -221,7 +221,9 @@ def _repl(loop: AgentLoop, console: Console) -> int:
                 from .tools.review import build_diff
                 console.echo(build_diff(loop.ctx.session.get("changes", [])))
             elif cmd == "/compact":
-                if loop.history.compact(llm=loop.backend, keep_recent=loop.config.compact_keep_recent):
+                # 走 loop.compact_context()：与自动压缩同一条路径，
+                # 压缩后同样会补上「常驻事实 + 工作区当前状态」
+                if loop.compact_context():
                     console.info(f"压缩完成，当前 ≈{loop.history.tokens} tokens")
                 else:
                     console.info("无需压缩（历史较短）。")

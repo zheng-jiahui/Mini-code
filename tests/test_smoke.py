@@ -26,11 +26,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.config import AgentConfig, LLMProfile, load_config  # noqa: E402
+from agent.history import MAX_FACTS_CHARS, History  # noqa: E402
 from agent.llm import AssistantMessage, MockBackend  # noqa: E402
 from agent.loop import AgentLoop  # noqa: E402
 from agent.parser import ToolCallParser, extract_text_calls  # noqa: E402
 from agent.tools import build_default_registry, build_tool_context  # noqa: E402
 from agent.tools.base import DIFF_CAPTURE_CAP, ToolResult  # noqa: E402
+from agent.profile import WORKSPACE_STATE_MARKER, list_workspace_files  # noqa: E402
 from agent.tools.review import build_diff  # noqa: E402
 
 
@@ -1442,9 +1444,224 @@ def test_auto_compaction_triggers_when_over_budget():
             loop.history.add_tool_result(f"id{i}", "read_file", "y" * 2000)
         assert loop.history.compact_count == 0
         loop._maybe_compact()
-        assert loop.history.compact_count == 1, "超预算应触发一次自动压缩"
+        assert loop.history.compact_count >= 1, "超预算应触发自动压缩"
+        # 预算（150）远小于"system 提示词 + 摘要"的最小体积，软压缩压不下来，
+        # 必须退化为硬压缩；但退化次数**必须有上限**，否则会一直压到只剩 system。
+        assert loop.history.compact_count <= 5, \
+            f"硬压缩降级次数失控：{loop.history.compact_count}"
         # system 提示词必须保留
         assert loop.history.messages[0]["role"] == "system"
+
+
+# ----------------------------------------------------------------------------
+# 常驻事实层（V7）：压缩不衰减
+# ----------------------------------------------------------------------------
+class _StubLLM:
+    """只服务 History._summarize 的极简假后端（不发网络请求）。
+
+    按调用次序依次返回预设文本；预设用尽后重复最后一条。
+    记录每次收到的 prompt，便于断言"哪些内容被拿去摘要了"。
+    """
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.prompts = []
+
+    def chat(self, messages, tools=None, tool_choice=None, on_delta=None):
+        self.prompts.append(messages[-1]["content"])
+        idx = min(len(self.prompts) - 1, len(self.replies) - 1)
+        return AssistantMessage(content=self.replies[idx], finish_reason="stop")
+
+
+def _fatten(history, rounds=12, tag=""):
+    """往历史里灌入若干轮噪声消息，用于把早期内容挤出 keep_recent 窗口。"""
+    for i in range(rounds):
+        history.add_user(f"{tag}第 {i} 轮无关消息，用于把早期内容挤出保留窗口。" * 3)
+        history.add_assistant(AssistantMessage(content=f"{tag}第 {i} 轮回复"))
+
+
+def test_facts_block_is_pinned_outside_the_summarized_middle():
+    """核心回归：事实块**不能**被当成普通历史消息再摘要一次，否则必然逐轮衰减。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        loop = AgentLoop(cfg, profile, MockBackend(profile, []), registry, console=None)
+
+        loop.history.add_user("请用 Python 3.11，并且绝对不要修改 config.yaml。")
+        loop.history.add_assistant(AssistantMessage(content="明白。"))
+        _fatten(loop.history)
+
+        llm = _StubLLM(
+            "【关键事实】\n- 必须用 Python 3.11\n- 绝对不要修改 config.yaml\n"
+            "【过程摘要】\n用户交代了约束，随后是无关对话。"
+        )
+        assert loop.history.compact(llm=llm, keep_recent=4)
+        assert "不要修改 config.yaml" in loop.history.facts
+        assert loop.history.kinds[1] == "facts", "事实块必须固定在 index 1"
+
+        _fatten(loop.history, tag="二轮")
+        assert loop.history.compact(llm=llm, keep_recent=4)
+
+        # 机制级断言：第二次压缩时，被送去摘要的"原始历史"里不该出现事实块。
+        # 事实是作为 old_facts 单独传进去要求整体重写的，不是混在流水账里再压一遍。
+        transcript = llm.prompts[1].split("===== 历史开始 =====")[1].split("===== 历史结束 =====")[0]
+        assert "<key_facts>" not in transcript, "事实块绝不能被当作普通历史消息再摘要一次"
+
+
+def test_hard_constraint_survives_repeated_compaction():
+    """行为级断言：连续压三轮之后，早期硬约束仍然在上下文里。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        loop = AgentLoop(cfg, profile, MockBackend(profile, []), registry, console=None)
+        loop.history.add_user("记住：绝对不要修改 config.yaml。")
+        loop.history.add_assistant(AssistantMessage(content="记住了。"))
+        _fatten(loop.history)
+
+        llm = _StubLLM(
+            "【关键事实】\n- 绝对不要修改 config.yaml\n【过程摘要】\n用户交代了硬约束。"
+        )
+        for round_no in range(3):
+            _fatten(loop.history, tag=f"第{round_no}轮")
+            assert loop.history.compact(llm=llm, keep_recent=4)
+        assert loop.history.compact_count == 3
+
+        blob = "\n".join(str(m.get("content") or "") for m in loop.history.messages)
+        assert "不要修改 config.yaml" in blob, "连续三次压缩后硬约束必须仍然存在"
+
+
+def test_facts_are_rewritten_not_appended():
+    """事实块是整体重写而非追加：被推翻的旧结论必须能消失。
+
+    若做成追加，事实块会单调膨胀，而且"方案 B 已失败"这种后来被推翻的结论
+    永远删不掉，反而持续误导后续决策。
+    """
+    h = History("sys")
+    _fatten(h)
+    llm = _StubLLM(
+        "【关键事实】\n- 方案 A 可行\n- 方案 B 已失败\n【过程摘要】\n试过 A 与 B。",
+        "【关键事实】\n- 方案 A 可行\n- 方案 B 可行（此前的失败结论已被推翻）\n【过程摘要】\n继续验证。",
+    )
+    assert h.compact(llm=llm, keep_recent=4)
+    assert "方案 B 已失败" in h.facts
+
+    _fatten(h, tag="后续")
+    assert h.compact(llm=llm, keep_recent=4)
+    assert "方案 B 可行" in h.facts
+    assert "已失败" not in h.facts, "被推翻的结论必须消失，否则事实块会膨胀到失真"
+
+
+def test_facts_survive_when_model_ignores_the_format():
+    """模型没按分节格式输出时，宁可不更新事实，也不能让已确认的约束凭空消失。"""
+    h = History("sys")
+    _fatten(h)
+    llm = _StubLLM("【关键事实】\n- 不要改 config.yaml\n【过程摘要】\n用户交代了约束。")
+    assert h.compact(llm=llm, keep_recent=4)
+    assert "不要改 config.yaml" in h.facts
+
+    _fatten(h, tag="后续")
+    unstructured = _StubLLM("总之前面做了不少事情，现在继续往下做。")
+    assert h.compact(llm=unstructured, keep_recent=4)
+    assert "不要改 config.yaml" in h.facts, "格式不合规时旧事实必须原样保留"
+
+
+def test_facts_block_is_capped():
+    """事实块必须有上限——它是常驻的，无上限就会反过来挤占上下文。"""
+    h = History("sys")
+    _fatten(h)
+    huge = ("【关键事实】\n"
+            + "\n".join(f"- 第 {i} 条事实，内容刻意写得长一些以便把事实块撑到上限之外" for i in range(80))
+            + "\n【过程摘要】\n略。")
+    assert h.compact(llm=_StubLLM(huge), keep_recent=4)
+    assert len(h.facts) < MAX_FACTS_CHARS * 1.2, f"事实块未被截断：{len(h.facts)} 字符"
+    assert "事实块已满" in h.facts
+
+
+def test_compaction_rebuilds_workspace_state_for_the_model():
+    """压缩后回灌工作区真实清单，并明确要求"别凭记忆写 old_text"。
+
+    摘要只答"做过什么"，答不了"磁盘上现在是什么样"。不补这一段，模型会拿压缩前的
+    旧记忆去 edit_block，old_text 必然对不上，白费一整轮。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        Path(tmp, "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        Path(tmp, "notes.md").write_text("# 说明\n", encoding="utf-8")
+        loop = AgentLoop(cfg, profile, MockBackend(profile, []), registry, console=None)
+        _fatten(loop.history)
+
+        assert loop.compact_context()
+        blob = "\n".join(str(m.get("content") or "") for m in loop.history.messages)
+        assert "calc.py" in blob and "notes.md" in blob, "工作区清单必须列出真实存在的文件"
+        assert "不要凭记忆写 old_text" in blob, "必须提醒模型重新 read_file，而不是凭记忆编辑"
+        assert "2 行" in blob, "清单应带行数，帮模型判断文件规模"
+
+
+def test_workspace_state_scan_skips_noise_and_caps_files():
+    """工作区扫描：跳过噪声目录，且对文件数设上限（避免一次注入淹没上下文）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "__pycache__").mkdir()
+        Path(tmp, "__pycache__", "junk.pyc").write_bytes(b"\x00\x01")
+        for i in range(40):
+            Path(tmp, f"f{i:02d}.py").write_text("x = 1\n", encoding="utf-8")
+
+        entries = list_workspace_files(tmp, max_files=10)
+        assert len(entries) == 11, "达到上限时应再多一条'已省略'标记"
+        assert entries[-1].get("more") is True
+        paths = [e["path"] for e in entries]
+        assert not any("__pycache__" in p for p in paths), "噪声目录必须被剪掉"
+        assert all(e["lines"] == 1 for e in entries[:-1]), "小文件应报出行数"
+
+
+def test_compaction_falls_back_to_hard_truncation_when_summary_cannot_fit():
+    """摘要压缩压不下来时退化为硬压缩，且降级次数有上限。
+
+    摘要压缩有"最小体积"（system + 事实 + 摘要 + 最近 N 条）。预算小于它时压完
+    仍然超阈值，不降级的话下一步又压一次——每步多花一次模型调用却什么都没省下
+    （实测 5073 → 5178，反而变大）。硬压缩丢弃更早历史且**不调模型**，便宜且有效。
+    """
+    h = History("sys " * 200)        # 光 system 就超预算，必然压不下来
+    _fatten(h, rounds=10)
+    llm = _StubLLM("【关键事实】\n- 约束 A\n【过程摘要】\n略。")
+
+    budget, threshold = 300, 0.5
+    assert h.tokens >= budget * threshold
+    assert h.compact(llm=llm, keep_recent=4, budget=budget)
+
+    before = h.compact_count
+    shrinks = 0
+    while h.tokens >= budget * threshold and shrinks < 4:
+        shrinks += 1
+        if not h.compact(llm=None, keep_recent=max(2, 4 - 2 * shrinks), budget=budget):
+            break
+    assert h.compact_count > before, "软压缩压不下来时必须继续硬压缩"
+    assert shrinks <= 4, "降级次数必须有上限，否则会压到只剩 system"
+    assert h.messages[0]["role"] == "system", "无论怎么压，system 提示词都不能丢"
+    assert len(h.messages) < 20, f"硬压缩应显著缩短历史，实际 {len(h.messages)} 条"
+
+
+def test_repeated_compaction_does_not_stack_stale_workspace_listings():
+    """连续压缩时，工作区清单只保留最新一份。
+
+    它是"可重建的事实"，价值只在于最新；旧副本堆在上下文里既白占额度，
+    又可能与现状矛盾（实测连续两次压缩就堆出了两份完全相同的清单）。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        Path(tmp, "a.py").write_text("x = 1\n", encoding="utf-8")
+        loop = AgentLoop(cfg, profile, MockBackend(profile, []), registry, console=None)
+        llm = _StubLLM("【关键事实】\n- 约束 A\n【过程摘要】\n略。")
+
+        for _ in range(3):
+            _fatten(loop.history, rounds=10)
+            loop.history.compact(llm=llm, keep_recent=6, budget=2000)
+            state = loop._workspace_state_note()
+            assert state
+            loop.history.drop_notes(WORKSPACE_STATE_MARKER)
+            loop.history.add_note(state)
+
+        hits = [m.get("content") or "" for m in loop.history.messages
+                if isinstance(m.get("content"), str)
+                and m["content"].startswith(WORKSPACE_STATE_MARKER)]
+        assert len(hits) == 1, f"工作区清单应只留最新一份，实际 {len(hits)} 份"
 
 
 # ----------------------------------------------------------------------------
