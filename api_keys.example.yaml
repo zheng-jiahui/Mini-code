@@ -15,6 +15,10 @@
 # 国家超算长沙中心 MaaS（对应 config.yaml 的 nscc 档位）
 NSCC_API_KEY: ""
 
+# 备用密钥（可选）：主 key 额度耗尽或失效时自动轮换，见 config.yaml 的 api_keys
+NSCC_API_KEY_2: ""
+NSCC_API_KEY_3: ""
+
 # 阿里云百炼 DashScope（dashscope 档位）
 DASHSCOPE_API_KEY: ""
 

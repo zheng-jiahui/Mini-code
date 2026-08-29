@@ -16,6 +16,18 @@ profiles:
     timeout: 120
     native_tools: true               # 不支持 function calling 的模型请设为 false
 
+  # 备用密钥（可选）：主 key 报 401/403/429 或额度耗尽时，
+  # 按顺序自动轮换到下一把，用完即止。留空列表 = 只用 api_key 一把钥匙。
+  nscc:
+    base_url: "https://maas.nscc-cs.cn/external/api/v1"
+    api_key: "${NSCC_API_KEY}"
+    api_keys: []                      # 例：["${NSCC_API_KEY_2}", "${NSCC_API_KEY_3}"]
+    model: "Qwen3.5"
+    temperature: 0.2
+    max_tokens: 8192
+    timeout: 180
+    native_tools: true
+
   deepseek:
     base_url: "https://api.deepseek.com"
     api_key: "${DEEPSEEK_API_KEY}"
