@@ -12,7 +12,7 @@ from typing import Any, Dict
 
 from .base import ToolContext, ToolResult, tool_spec
 
-__all__ = ["finish", "ask_user", "register", "FINISH_SENTINEL"]
+__all__ = ["finish", "ask_user", "plan", "register", "FINISH_SENTINEL"]
 
 FINISH_SENTINEL = "__finish__"
 
@@ -77,5 +77,41 @@ def ask_user(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     return ToolResult.success(f"用户回答：{answer or '（未回答，请自行合理假设并继续）'}")
 
 
+@tool_spec(
+    name="plan",
+    description=(
+        "对于较复杂的任务，先把分步计划写在这里（例如：1. 读 X 弄清现状；2. 用 edit_block 改 Y；"
+        "3. 跑测试验证）。记录后请按计划在后续步骤执行，便于用户审阅、也让你自己对齐目标。\n"
+        "简单任务（改几行、写个小脚本）不必调用本工具。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "steps": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "分步计划，每条是一句可执行的操作描述",
+            },
+        },
+        "required": ["steps"],
+    },
+    category="控制",
+    when_not_to_use=(
+        "三五步就能做完的小任务不要先列计划，直接做（列计划本身也要花一轮）。"
+        "计划不是许愿——步骤要能对应到具体工具调用；也不要列完就当执行完了。"
+    ),
+)
+def plan(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    steps = args.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        return ToolResult.failure("计划不能为空", hint="请列出 2-5 条分步计划。")
+    steps = [str(s).strip() for s in steps if str(s).strip()]
+    if not steps:
+        return ToolResult.failure("计划不能为空", hint="请列出具体的步骤。")
+    text = "已记录计划，将按此执行：\n" + "\n".join(f"{i + 1}. {s}" for i, s in enumerate(steps))
+    ctx.session["plan"] = steps
+    return ToolResult.success(text, meta={"steps": len(steps)})
+
+
 def register(registry) -> None:
-    registry.register_many([finish, ask_user])
+    registry.register_many([finish, ask_user, plan])

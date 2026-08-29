@@ -248,13 +248,55 @@
   也是自纠错信号（模型能在 finish 前发现"我其实改错了"）。
 - 单文件回退比整目录回滚更细粒度，代价只是快照里多一次"挑文件"拷贝——能力从既有归档自然长出。
 
+### 补充修复（commit `e4ba793`，实跑后回补）
+
+首版提交后**实跑真实任务**才暴露的两个缺陷——单测全绿但演示会翻车，
+说明"实跑验证"这一步不能省：
+
+1. **所有新建文件的 diff 全部丢失**（最严重）
+   `record_change` 用 `before is not None and after is not None` 反推"能否生成 diff"。
+   但新建文件的 `before` 本来就该是 None（文件原本不存在），于是被判成"内容过大未采集"。
+   实测：一个 32 字符的新建文件，`/diff` 只回一句「改动过大，未生成 diff」——
+   而新建恰恰是最该被审阅的一类改动。
+2. **`run_command`/`rollback` 被当成文件改动渲染**
+   这些是操作、不是文件内容，没有 before/after，却在 diff 正文里刷「改动过大」噪声。
+
+**根因**：`None` 有两种完全不同的含义——"文件原本不存在" vs "内容没采集"，
+代码却用一个 `is not None` 同时判断两件事。
+**修法**：显式记录 `captured` 标记把两者分开；只有带 `path` 的文件改动才参与 diff。
+
+顺带加固 `write_file`：覆盖写大文件时不再为生成 diff 而把全文读进内存
+（超限则流式统计行数、diff 显式标记未采集）。否则 `before=""` 会被解读成
+"文件原本是空的"，把一次**修改**显示成**全量新增**——比不显示更糟。
+
+**回归测试**（3 个新用例，共 **43** 个全通过）：
+`test_new_file_change_is_diffable_not_mistaken_for_too_big` /
+`test_record_change_marks_command_and_oversize_as_not_captured` /
+`test_write_over_huge_file_marks_change_not_captured`
+
+**实跑验证**：真实任务「写 greet.py → 改成 Hello, MiniCode → 运行验证」，
+`/diff` 正确输出两段 unified diff，命令类操作不再出现；
+把 greet.py 改坏后用 `rollback(files=["greet.py"])` 精确还原，同级文件不受影响。
+
+**遗留问题**：diff 是"改后回顾"而非"改前预览"——真要做改前预览得让
+`write_file`/`edit_block` 先 dry-run，会多一轮交互，收益不大，暂不做。
+
 ---
 
-## V5 自主性增强 ⬜ 待做
+## V5 自主性增强 ✅ 完成
 
-- 复杂任务先出计划再执行（plan-then-execute）
-- 无依赖的工具调用并行（多个 `read_file`/`grep_search` 一起发）
-- 项目画像：自动识别语言/框架/构建命令，注入 system prompt
+- **项目画像**（新增 `agent/profile.py`）：每次切入任务目录自动扫描语言/框架/构建命令/测试命令，
+  注入 system prompt 的「# 项目画像」段落，让模型"先看清项目再动手"而非盲猜。
+- **plan 工具**（控制类，`meta.py`）：复杂任务前先列分步计划写入 session，供用户审阅与模型对齐目标。
+- **复杂任务先计划**（loop）：命中复杂度启发式（描述≥40字或含"实现/重构/搭建/系统…"等词）时，
+  开头注入"建议先用 plan 工具列计划"的提示。
+- **只读工具并行**（loop）：一轮里多个 `read_file`/`list_dir`/`grep_search`/`find_files`/`diff`
+  用线程池并行发出（`_execute_parallel`），回执按原顺序写回、统计无竞态；有副作用的写/命令仍顺序执行。
+
+**配套测试**（5 个新用例，共 48 个全通过）：
+`test_project_profile_detection` / `test_project_profile_renders_section_when_present` /
+`test_plan_tool_records_plan` / `test_complex_task_receives_plan_hint` /
+`test_parallel_readonly_calls_execute`
 
 ---
 
@@ -263,10 +305,11 @@
 如果上面 8 个版本都完成且距天亮还有时间，可以做这些（每做一项都要走同样的闭环）：
 
 - 流式输出：边生成边打印，长任务体验更好
-- 多语言项目的测试命令适配（Java/Maven、Go、Rust）
-- 工具执行的超时/重试策略细化
+- ~~多语言项目的测试命令适配（Java/Maven、Go、Rust）~~ ✅ 已做，见 `agent/selfrepair.py`
+  与 commit `532ebe3`（Go/Rust 原本就有，本轮补齐的是 Java/Maven/Gradle）
+- 工具执行的超时/重试策略细化 —— ✅ **已完成**（commit `16c8fa9`）
 - 性能基准：记录各阶段耗时，找出瓶颈
-- 给每个工具写一份"什么时候不该用它"的说明（反向文档，面试很加分）
+- 给每个工具写一份"什么时候不该用它"的说明（反向文档，面试很加分）—— ✅ **已完成**（commit `7397240`）
 
 ---
 
@@ -284,3 +327,32 @@
   精确 token（tiktoken 优先）+ 智能压缩（信号行优先，并修 render 漏 import 的 NameError）+ /stats 成本面板
 - 2026-08-30 03:10 — V6 交付打磨完成，36 个测试通过；DESIGN.md + 视频脚本 + README 定稿（586 字）+ 历史复核干净
 - 2026-08-30 03:50 — V4 可审阅性完成，39 个测试通过；before/after 采集 + unified diff（/diff 与 diff 工具）+ 单文件级 rollback
+- 2026-08-30 01:05 — **V4 补充修复（commit `e4ba793`）**，43 个测试通过；
+  实跑发现并修掉两个真实缺陷：新建文件的 diff 全被误判成"改动过大"（before=None 语义二义性）、
+  命令类操作被当文件改动渲染；顺带加固大文件覆盖写不读全文、不误显示为全量新增。
+  （本条曾误记为"随 V5 一并提交"，实际是独立提交 `e4ba793`，已更正。）
+- 2026-08-30 01:15 — **追加工作：测试命令识别支持多语言（commit `532ebe3`）**，51 个测试通过；
+  补 Java（pom.xml→Maven、build.gradle(.kts)→Gradle，wrapper 分平台：Windows 用 `mvnw.cmd`，
+  因 run_command 走 cmd.exe 而 `./mvnw` 跑不通）、tox/nox/phpunit、yarn 识别；
+  修探测链在缺 [tool.pytest] 的 pyproject.toml 上 `return None` 提前终止的 bug（应为 continue）；
+  Makefile 无 test 目标时不再建议注定失败的 `make test`。
+  实跑：真实 Maven 骨架 → 项目画像识别为 Java、`mvn -q test` 正确注入 prompt；
+  另跑真实自修复任务（埋 bug→运行→定位→修复→验证）确认闭环无回归。
+- 2026-08-30 05:20 — V5 自主性增强完成，48 个测试通过（**提交时共计 51 个**）；
+  新增项目画像（agent/profile.py，自动识别语言/框架/测试命令注入 prompt）、plan 工具（复杂任务先计划）、
+  只读工具并行（read/grep/list/diff 一轮内 ThreadPoolExecutor 并发，回执保序）。
+  ⚠️ 更正：本条原记"一并交付 V4 补充修复与 selfrepair 加固"——实际这两项已由
+  `e4ba793`、`532ebe3` 两个独立提交先行落地，V5 提交中并不包含它们。
+- 2026-08-30 01:20 — **追加工作：工具反向文档（commit `7397240`）**，53 个测试通过；
+  给 12 个工具都补上「什么时候不该用它」，并用测试钉死规范（新增工具漏写就红）。
+  关键设计决策：反向文档必须让模型在**两条通道**上都看到——默认走 native function calling，
+  模型读的是 `openai_schema` 的 description，只写进系统提示词等于没写，
+  故新增 `ToolSpec.effective_description()` 让两条通道一致。
+  代价明算：系统提示词 3507→4766 字符（约 +1k tokens），保留 `describe(with_guardrail=False)` 作退路。
+  注：`plan` 工具的反向文档落在 V5 的 plan 新增 hunk 里，随 V5 提交一并落地。
+- 2026-08-30 01:25 — **追加工作：命令超时/重试策略（commit `16c8fa9`）**，55 个测试通过；
+  修了一个真实漏洞——`timeout` 原先直接用模型传的值、没有上限，传 99999 会把整个会话挂死
+  几小时，现在夹到 [1, max_command_timeout]（默认 300s）并告知模型被夹取；
+  超时提示从"报错"升级为"可行动的下一步"（能加时间就给上限与写法，已到上限就明说只能缩范围）。
+  明确**不做自动重试**并写明理由：shell 命令有副作用，重试≠重放，可能造成重复副作用。
+  实跑：真实配置传 timeout=99999 → 夹到 300s 并回显提示；真实任务 5 步 0 失败 9.1s。

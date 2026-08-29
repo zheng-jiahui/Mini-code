@@ -1065,6 +1065,90 @@ def test_build_diff_handles_new_and_unchanged():
 
 
 # ----------------------------------------------------------------------------
+# V5：自主性增强（项目画像 / plan 工具 / 复杂任务先计划 / 只读工具并行）
+# ----------------------------------------------------------------------------
+def test_project_profile_detection():
+    """扫描工作区应识别语言/框架/构建与测试命令，并结构化返回。"""
+    from agent.profile import detect_project_profile
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "requirements.txt").write_text("", encoding="utf-8")
+        Path(tmp, "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        prof = detect_project_profile(tmp)
+        assert "Python" in prof["languages"]
+        assert prof["test_cmd"] == "pytest -q"
+        assert "pip install -r requirements.txt" in prof["build_cmds"]
+
+
+def test_project_profile_renders_section_when_present():
+    """有画像时 build_system_prompt 应注入『项目画像』段落；空画像返回空串。"""
+    from agent.profile import format_project_profile
+    assert format_project_profile({}) == ""
+    section = format_project_profile({
+        "languages": ["Python"], "frameworks": ["flask"],
+        "build_cmds": ["pip install -r requirements.txt"], "test_cmd": "pytest -q",
+    })
+    assert "# 项目画像" in section
+    assert "Python" in section
+    # 同一段文字经 build_system_prompt 后仍以『# 项目画像』出现
+    from agent.prompts import build_system_prompt
+    sp = build_system_prompt(tool_list="", workspace="/tmp/x",
+                             restrict_to_workspace=False, project_profile=section)
+    assert "# 项目画像" in sp
+
+
+def test_plan_tool_records_plan():
+    """plan 工具把分步计划写入 session，供用户审阅与模型对齐。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        r = registry.execute("plan", {"steps": ["读 README 弄清现状", "用 edit_block 改入口", "跑测试"]}, ctx)
+        assert r.ok, r.render()
+        assert ctx.session["plan"] == ["读 README 弄清现状", "用 edit_block 改入口", "跑测试"]
+        assert "已记录计划" in r.render()
+
+
+def test_complex_task_receives_plan_hint():
+    """复杂任务开头应注入"先用 plan 工具列计划"的提示，引导先规划再动手。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        script = [{"content": "完成。", "tool_calls": [
+            {"name": "finish", "arguments": {"summary": "ok"}}]}]
+        backend, profile = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        # 多关键词 + 超长，明显命中"复杂任务"启发式
+        result = loop.run("请帮我实现一个端到端的爬虫系统，包含调度、解析、存储三个模块，并保证可测试")
+        assert result.succeeded
+        joined = "\n".join(m.get("content", "") for m in loop.history.messages)
+        assert "plan" in joined, "复杂任务应提示先调用 plan 工具"
+        assert "较复杂的任务" in joined, "开头应注入『先计划再动手』的建议"
+
+
+def test_parallel_readonly_calls_execute():
+    """一轮里的多个只读调用（read_file 两次）应并行发出且不破坏循环顺序。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        # 预先放两份文件，避免触发"假完成拦截"（没改过文件）
+        Path(tmp, "a.py").write_text("AAA\n", encoding="utf-8")
+        Path(tmp, "b.py").write_text("BBB\n", encoding="utf-8")
+        cfg, profile, registry, _ = _make_env(tmp)
+        # 一轮里同时 read a.py 与 b.py（都是只读工具）→ 并行分支
+        script = [
+            {"content": "读两份文件。", "tool_calls": [
+                {"name": "read_file", "arguments": {"path": "a.py"}},
+                {"name": "read_file", "arguments": {"path": "b.py"}}]},
+            {"content": "完成。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "ok"}}]},
+        ]
+        backend, profile = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        result = loop.run("读取项目里已有的两份文件")
+        assert result.succeeded
+        # 2 次 read（并行）+ 1 次 finish = 3
+        assert result.tool_calls == 3, result.tool_calls
+        joined = "\n".join(m.get("content", "") for m in loop.history.messages)
+        assert "AAA" in joined, "并行读取结果应回灌历史"
+        assert "BBB" in joined
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

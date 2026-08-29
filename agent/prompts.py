@@ -48,6 +48,7 @@ _BASE = """\
 # 可用工具
 {tool_list}
 
+{project_profile}
 # 工具调用协议
 {protocol}
 
@@ -137,6 +138,7 @@ def build_system_prompt(
     *,
     native_tools: bool = True,
     restrict_to_workspace: bool = True,
+    project_profile: str = "",
 ) -> str:
     """组装完整 System Prompt。
 
@@ -145,12 +147,15 @@ def build_system_prompt(
         workspace: 工作区绝对路径。
         native_tools: True 时注入原生 tool_calls 协议，否则注入文本协议。
         restrict_to_workspace: 是否开启路径沙箱（影响提示词中的路径规则表述）。
+        project_profile: 由 agent.profile 生成的「项目画像」段落（空串表示无）。
     """
     path_rule = (
         f"绝对路径若位于 {workspace} 之外会被拒绝，所有文件操作必须留在工作区内。"
         if restrict_to_workspace
         else "当前未启用路径沙箱，但仍需谨慎，不要改动与任务无关的系统文件。"
     )
+    if project_profile:
+        project_profile = project_profile + "\n"
     return _BASE.format(
         os_info=f"{platform.system()} {platform.release()}",
         shell=os.environ.get("SHELL") or ("PowerShell / cmd" if os.name == "nt" else "sh"),
@@ -159,6 +164,7 @@ def build_system_prompt(
         now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         path_rule=path_rule,
         tool_list=tool_list,
+        project_profile=project_profile,
         protocol=PROTOCOL_NATIVE if native_tools else PROTOCOL_TEXT,
     )
 

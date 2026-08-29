@@ -55,6 +55,7 @@ import json
 import re
 import shutil
 import time
+import concurrent.futures as _cf
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,11 +67,15 @@ from .history import History
 from .llm import AssistantMessage, LLMBackend, ToolCall
 from .parser import ToolCallParser
 from .prompts import BUDGET_WARNING, NO_PROGRESS_HINT, build_system_prompt, build_task_message
+from .profile import detect_project_profile, format_project_profile, looks_like_complex_task
 from .tools import build_tool_context
 from .tools.base import ToolContext, ToolRegistry, ToolResult
 from .tools.meta import FINISH_SENTINEL
 
 __all__ = ["RunResult", "AgentLoop"]
+
+# 只读工具：无副作用、互不依赖，可在同一轮里并行发出（V5 自主性）
+_READONLY_TOOLS = frozenset({"read_file", "list_dir", "grep_search", "find_files", "diff"})
 
 _EMPTY_OUTPUT_HINT = (
     "你上一次的回复中没有包含任何工具调用，也没有明确的收尾标记。\n"
@@ -157,11 +162,13 @@ class AgentLoop:
 
         self.native = bool(profile.native_tools) and backend.supports_native_tools
         self.parser = ToolCallParser(registry, use_native=self.native)
+        self._project_profile = ""   # V5：自动识别的项目画像段落（随任务目录刷新）
         self.system_prompt = system_prompt or build_system_prompt(
             tool_list=registry.describe(),
             workspace=str(config.resolved_workspace()),
             native_tools=self.native,
             restrict_to_workspace=config.restrict_to_workspace,
+            project_profile=self._project_profile,
         )
         self.history = History(self.system_prompt)
         self.ctx: ToolContext = build_tool_context(config, console=console, session={})
@@ -291,11 +298,16 @@ class AgentLoop:
         self.ctx.session.setdefault("changes", [])
         self.ctx.session["task_name"] = self._task_name   # 供 rollback 工具定位快照
 
+        # V5 项目画像：每次切入任务目录都重新扫描，把语言/框架/测试命令喂给系统提示词
+        prof = detect_project_profile(self._task_dir)
+        self._project_profile = format_project_profile(prof)
+
         self.system_prompt = build_system_prompt(
             tool_list=self.registry.describe(),
             workspace=str(self._task_dir),
             native_tools=self.native,
             restrict_to_workspace=self.config.restrict_to_workspace,
+            project_profile=self._project_profile,
         )
         self.history.system_prompt = self.system_prompt
         if self.history.messages and self.history.messages[0].get("role") == "system":
@@ -331,6 +343,13 @@ class AgentLoop:
 
         self.history.add_user(build_task_message(task, extra_context))
         self._emit("task_start", {"task": task})
+
+        # V5 自主性：复杂任务开头注入"先用 plan 工具列计划"的提示，引导先规划再动手
+        if self.config.plan_hint and looks_like_complex_task(task):
+            self.history.add_note(
+                "这是一个较复杂的任务。建议先调用 `plan` 工具列出分步计划（看清现状 → 改动 → 验证），"
+                "再开始动手；计划能帮你和用户对齐目标，也避免东改西改。"
+            )
 
         try:
             self._loop_body(result)
@@ -474,11 +493,19 @@ class AgentLoop:
         return outcome, attempts
 
     def _execute_calls(self, calls: List[ToolCall], result: RunResult) -> Optional[str]:
-        """顺序执行一批工具调用，把回执写回历史。
+        """执行一批工具调用，把回执写回历史。
+
+        一轮里若全是只读工具调用（read_file / list_dir / grep_search / find_files / diff），
+        且无 finish，则并行发出以缩短等待；其余（含写文件、run_command、finish）顺序执行，
+        因为后者有副作用或会改变终止状态，必须保持顺序与即时拦截。
 
         Returns:
             None 表示继续循环；否则返回终止原因字符串。
         """
+        # 并行分支：多个只读调用一起发（V5 自主性）
+        if (self.config.parallel_tools and len(calls) > 1
+                and all(c.name in _READONLY_TOOLS for c in calls)):
+            return self._execute_parallel(calls, result)
         for call in calls:
             result.tool_calls += 1
             self._total_tool_calls += 1
@@ -550,6 +577,49 @@ class AgentLoop:
                     return "too_many_errors"
 
             self._fingerprints.append(call.fingerprint())
+
+        return None
+
+    def _execute_parallel(self, calls: List[ToolCall], result: RunResult) -> Optional[str]:
+        """并行执行一批只读工具调用（见 _execute_calls 的并行分支说明）。
+
+        只读工具不写 session、不触发 finish / 自修复，因此并行安全。回执按原顺序写回历史，
+        统计与指纹在主线程里顺序累计，避免竞态。
+        """
+        futures = {}
+        with _cf.ThreadPoolExecutor(max_workers=min(len(calls), 8)) as ex:
+            for c in calls:
+                fut = ex.submit(self.registry.execute, c.name, c.arguments, self.ctx, call_id=c.id)
+                futures[fut] = c
+            results = [None] * len(calls)
+            for fut in _cf.as_completed(futures):
+                c = futures[fut]
+                results[calls.index(c)] = fut.result()
+
+        for c, tool_result in zip(calls, results):
+            result.tool_calls += 1
+            self._total_tool_calls += 1
+            self._tool_timings[c.name] = self._tool_timings.get(c.name, 0.0) + tool_result.elapsed
+            self._tool_calls_by_name[c.name] = self._tool_calls_by_name.get(c.name, 0) + 1
+
+            style = "native" if c.source == "native" else "text"
+            rendered = tool_result.render(max_chars=int(self.config.max_tool_output_chars))
+            if len(tool_result.output or tool_result.error or "") > int(self.config.max_tool_output_chars):
+                self._output_compressions += 1
+            self.history.add_tool_result(c.id, c.name, rendered, style=style)
+
+            self._emit("tool_result", {"name": c.name, "ok": tool_result.ok, "output": rendered[:400]})
+            if self.console:
+                self.console.tool_result(c.name, tool_result.ok, rendered, meta=f"{tool_result.elapsed:.2f}s")
+
+            if tool_result.ok:
+                self._consecutive_errors = 0
+            else:
+                result.errors += 1
+                self._consecutive_errors += 1
+                if self._consecutive_errors >= int(self.config.max_consecutive_errors):
+                    return "too_many_errors"
+            self._fingerprints.append(c.fingerprint())
 
         return None
 

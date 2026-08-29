@@ -104,6 +104,10 @@ class AgentConfig:
     auto_compact: bool = True
     compact_threshold: float = 0.75
 
+    # V5 自主性：只读工具并行、复杂任务先计划
+    parallel_tools: bool = True        # 把一轮里的多个只读调用（read/grep/list/diff）并行发出
+    plan_hint: bool = True             # 复杂任务开头注入"先用 plan 工具列计划"的提示
+
     restrict_to_workspace: bool = True
     command_policy: str = "confirm"      # allow | confirm | deny
     backup_on_write: bool = True
