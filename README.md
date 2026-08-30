@@ -83,7 +83,8 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 │       ├── git_tool.py       # git：受控版本控制（白名单只读 + add + 受控 commit）
 │       ├── fsops.py          # move_file / copy_file / delete（删前备份）
 │       ├── memory.py         # memory：跨会话持久的项目记忆（.minicode/memory.md）
-│       └── replace_files.py  # replace_in_files：跨文件安全查找替换（仓库级重命名，默认 dry_run）
+│       ├── replace_files.py  # replace_in_files：跨文件安全查找替换（仓库级重命名，默认 dry_run）
+│       └── lint.py           # lint：代码检查（零配置 Python 语法体检 + 结构化解析 linter 输出）
 ├── docs/DESIGN.md            # 完整设计说明（主循环流程图、接口定义、错误策略等）
 └── tests/                    # 冒烟测试（Mock 后端，无需 API key）
 ```
@@ -94,7 +95,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 
 | 能力 | 说明 |
 |---|---|
-| 工具（共 25 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file` `move_file` `copy_file` `delete` `replace_in_files`（跨文件替换）；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch` `recall`（相关文件检索）；执行：`run_command`；版本控制：`git`（受控提交 + 只读 + add）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签）`memory`（项目记忆） |
+| 工具（共 26 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file` `move_file` `copy_file` `delete` `replace_in_files`（跨文件替换）；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch` `recall`（相关文件检索）；执行：`run_command`；检查：`lint`（代码检查）；版本控制：`git`（受控提交 + 只读 + add）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签）`memory`（项目记忆） |
 | 双通道调用 | 优先原生 `tool_calls`；模型不支持时自动切到 ```json 文本协议 |
 | 上下文管理 | token 估算 → 工具回执智能压缩（信号行优先）→ 超阈值摘要压缩 → 硬截断兜底 |
 | 长程记忆 | **常驻事实层**：硬约束/技术选型/已失败方案常驻且不参与再压缩，避免"摘要的摘要"式衰减；压缩后重建工作区真实清单 |
@@ -115,6 +116,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 | 文件增删 | `move_file` / `copy_file` / `delete` 补足文件的移动 / 复制 / 删除；`delete` 删除前先备份到 `.agent_backups` 可恢复，删目录需 `recursive=true` |
 | 相关文件检索 | `recall` 给定一段模糊意图（如「登录失败重试」「导出 CSV」），按相关度排序找回最相关的若干文件并给出最相关的几行片段；模型不必知道确切函数名也能先定位（类比 Cursor/Claude Code 的 find relevant code），一轮内可与其他只读工具并行 |
 | 跨文件替换 | `replace_in_files` 按 glob 圈定一批文件，把某段文本（或正则）全部替换（仓库级符号重命名）；默认 `dry_run=true` 仅预览会动哪些文件/几处，确认后再落盘；写前逐文件备份可 /undo 回滚，二进制文件自动跳过 |
+| 代码检查 | `lint` 写完代码、finish 前先自查：不传 command 时对 Python 文件做零配置语法体检（内置 compile，纯标准库），传 command 时运行你给的检查器（如 `ruff check .`）并结构化解析 `文件:行: 信息`；只读护栏禁止 `--fix` 等改写选项，可据此逐条修复 |
 
 ---
 

@@ -16,16 +16,16 @@
    workplace/任务名/                          该任务的最新代码
    .agent_backups/任务名_时间戳_第N次/        每次生成的完整归档，序号自动递增
    .overwrites/                              覆盖写单文件备份，供 /undo 回滚
-5) 测试：python tests/test_smoke.py（113 个用例，无需 API key）
+5) 测试：python tests/test_smoke.py（114 个用例，无需 API key）
         python tests/test_fake_server.py（本地假服务端，验证 HTTP 协议链路）
 
 二、特色功能
 1. 零框架：未使用 LangChain / LlamaIndex / OpenAI Agents SDK / AutoGen / CrewAI 等任何 Agent 框架，
    仅用 OpenAI 兼容聊天补全客户端；对话历史、工具、解析、循环、压缩、错误全部自写。
 2. 双通道工具调用：优先原生 function calling；模型/网关不支持时自动切换 ```json 文本协议 + 自写解析校验纠错。
-3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环（共 25 个）：
+3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环（共 26 个）：
    read_file / write_file / edit_block / apply_patch / read_many_files / replace_in_file /
-   move_file / copy_file / delete(删前备份) / replace_in_files(跨文件替换) / list_dir / run_command /
+   move_file / copy_file / delete(删前备份) / replace_in_files(跨文件替换) / list_dir / run_command / lint(代码检查) /
    grep_search(支持上下文) / find_files / web_fetch / diff / recall(相关文件检索) /
    git(受控提交/只读) / plan / finish / ask_user / rollback / todo(任务清单) / think(推理便签) /
    memory(项目记忆)。

@@ -2793,6 +2793,52 @@ def test_replace_in_files_dry_run_then_apply_with_backup():
         assert backups, "改写前应已备份"
 
 
+def test_lint_runs_py_syntax_check_and_parses_command_output():
+    import subprocess
+    import unittest.mock as mock
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        assert "lint" in registry.names()
+
+        # 模式二：零配置 Python 语法体检
+        (Path(tmp) / "ok.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        (Path(tmp) / "bad.py").write_text("def f(:\n    pass\n", encoding="utf-8")  # 语法错误
+        r_ok = registry.execute("lint", {"target": "ok.py"}, ctx)
+        assert r_ok.ok and "通过" in r_ok.output
+        r_bad = registry.execute("lint", {"target": "bad.py"}, ctx)
+        assert r_bad.ok and "1 个问题" in r_bad.output and "bad.py:1" in r_bad.output
+
+        # 模式一：用户给命令，解析 file:line: msg
+        def fake_run(cmd, **kw):
+            assert cmd[0] == "ruff"
+            return subprocess.CompletedProcess(
+                cmd, 1,
+                stdout="src/foo.py:12: unused import X\nbar.py:3: undefined name Y\n",
+                stderr="",
+            )
+        with mock.patch("agent.tools.lint.subprocess.run", fake_run):
+            rc = registry.execute("lint", {"command": "ruff check ."}, ctx)
+            assert rc.ok and "2 个问题" in rc.output
+            assert "src/foo.py:12" in rc.output and "bar.py:3" in rc.output
+
+        # 禁止 --fix 等改写选项
+        rf = registry.execute("lint", {"command": "ruff check . --fix"}, ctx)
+        assert not rf.ok, "--fix 必须被拒绝"
+
+        # 退出码非零但输出无法解析成 file:line → 回显原始输出
+        def fake_run_raw(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 2, stdout="BOOM: something odd\n", stderr="")
+        with mock.patch("agent.tools.lint.subprocess.run", fake_run_raw):
+            rr = registry.execute("lint", {"command": "mypy ."}, ctx)
+            assert rr.ok and "BOOM" in rr.output and rr.meta.get("issues") == 0
+
+
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
