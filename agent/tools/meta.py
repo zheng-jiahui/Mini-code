@@ -12,7 +12,7 @@ from typing import Any, Dict
 
 from .base import ToolContext, ToolResult, tool_spec
 
-__all__ = ["finish", "ask_user", "plan", "todo", "register", "FINISH_SENTINEL"]
+__all__ = ["finish", "ask_user", "plan", "register", "FINISH_SENTINEL"]
 
 FINISH_SENTINEL = "__finish__"
 
@@ -113,107 +113,5 @@ def plan(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     return ToolResult.success(text, meta={"steps": len(steps)})
 
 
-_STATUS_ORDER = {"pending": 0, "in_progress": 1, "completed": 2}
-
-
-def _render_todos(todos: list) -> str:
-    if not todos:
-        return "（任务清单为空，调用 todo(action=\"add\", items=[...]) 添加）"
-    lines = []
-    for t in todos:
-        mark = {"pending": "⬜", "in_progress": "🔵", "completed": "✅"}.get(t["status"], "⬜")
-        lines.append(f"{t['id']}. {mark} [{t['status']}] {t['text']}")
-    return "当前任务清单：\n" + "\n".join(lines)
-
-
-@tool_spec(
-    name="todo",
-    description=(
-        "维护一份跨轮持久的任务清单（带进度状态），适合多步骤、需要中途对齐目标的任务。\n"
-        "action 取值：add（追加若干待办）、update（把某项标记为 in_progress/completed）、"
-        "list（查看）、clear（清空）。\n"
-        "比一次性的 plan 更实用：你能随时把第 N 项标记为进行中/已完成，让模型和自我都看清进度。"
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "description": "操作：add | update | list | clear，默认 list",
-                "default": "list",
-            },
-            "items": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "action=add 时要追加的待办文本列表",
-            },
-            "id": {
-                "type": "integer",
-                "description": "action=update 时要更新的任务编号",
-            },
-            "status": {
-                "type": "string",
-                "description": "action=update 时设成的新状态：in_progress | completed（或 pending 重新打开）",
-            },
-        },
-        "required": [],
-    },
-    category="控制",
-    when_not_to_use=(
-        "三五步就能做完的小任务不必建清单，直接做更省事；"
-        "清单不是许愿——加进去的项要能对应到具体工具调用，并随进度真正去 update 状态，"
-        "别列完就再也不看。只问一个问题用 ask_user，别往清单里塞。"
-    ),
-)
-def todo(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-    action = (args.get("action") or "list").strip().lower()
-    todos: list = ctx.session.setdefault("todos", [])
-
-    if action == "add":
-        items = args.get("items") or []
-        if not isinstance(items, list) or not items:
-            return ToolResult.failure("action=add 时必须提供 items 列表", hint="如 todo(action=\"add\", items=[\"读现状\", \"改 X\"])")
-        added = 0
-        for it in items:
-            s = str(it).strip()
-            if not s:
-                continue
-            todos.append({"id": len(todos) + 1, "text": s, "status": "pending"})
-            added += 1
-        if added == 0:
-            return ToolResult.failure("items 为空或全部为空白，未添加任何待办")
-        return ToolResult.success(
-            f"已添加 {added} 项，清单共 {len(todos)} 项。\n" + _render_todos(todos),
-            meta={"count": len(todos)},
-        )
-
-    if action == "update":
-        tid = args.get("id")
-        status = (args.get("status") or "").strip().lower()
-        if not isinstance(tid, int) or tid <= 0:
-            return ToolResult.failure("action=update 时必须提供合法的 id（正整数）")
-        if status not in _STATUS_ORDER:
-            return ToolResult.failure(
-                f"status 必须是 in_progress / completed / pending 之一，收到 {status!r}",
-                hint="例如把第 2 项标记为进行中：todo(action=\"update\", id=2, status=\"in_progress\")",
-            )
-        target = next((t for t in todos if t["id"] == tid), None)
-        if target is None:
-            return ToolResult.failure(f"找不到编号为 {tid} 的任务", hint="先用 todo(action=\"list\") 查看有效编号。")
-        target["status"] = status
-        return ToolResult.success(
-            f"已将第 {tid} 项标记为 {status}。\n" + _render_todos(todos),
-            meta={"updated": tid, "status": status},
-        )
-
-    if action == "clear":
-        before = len(todos)
-        todos.clear()
-        return ToolResult.success(f"已清空任务清单（原 {before} 项）。", meta={"cleared": before})
-
-    # 默认 list
-    return ToolResult.success(_render_todos(todos), meta={"count": len(todos)})
-
-
 def register(registry) -> None:
-    registry.register_many([finish, ask_user, plan, todo])
+    registry.register_many([finish, ask_user, plan])

@@ -39,15 +39,10 @@
    "看起来像但其实错的解"必须拦下。这是硬要求，见 tests 里的两条测试。
    一个恒为真的验证器不会报错，只会安静地给出 100% 通过率——比没有验证器更危险。
 
-当前 11 个维度，分两档（失败在哪一档是有信息量的诊断，例如"只会新建、修不了 bug"）：
-    standard（10 个，从零写小模块）：
-        新建+异常边界 / 修 bug / 读数据出报表 / 算法（保序去重） / 数据结构（LRU 淘汰）
-        / CLI 参数契约 / 非结构化文本→结构化统计 / 递归嵌套结构 / 跨模块协作与状态一致性
-        / 日志抽取与过滤
-    hard（1 个，在已有模块上增量改、保持既有行为）：
-        增量改造：给倒排索引库加 order-sensitive 的 phrase_search，不破坏既有方法
-    难度梯度是评测台后续的重点——把"10/10 全对"变成"standard 9/10、hard 0/1"，
-    才能区分强弱模型（见 --repeat 取分布）。hard 任务当前只有 1 个，规模会随迭代扩大。
+当前 10 个维度（失败在哪一档是有信息量的诊断，例如"只会新建、修不了 bug"）：
+    新建+异常边界 / 修 bug / 读数据出报表 / 算法（保序去重） / 数据结构（LRU 淘汰）
+    / CLI 参数契约 / 非结构化文本→结构化统计 / 递归嵌套结构 / 跨模块协作与状态一致性
+    / 日志抽取与过滤
 
 局限（如实写）
 --------------
@@ -74,8 +69,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-__all__ = ["EvalTask", "EvalOutcome", "TASKS", "run_suite", "render_report",
-           "render_repeat_report", "main"]
+__all__ = ["EvalTask", "EvalOutcome", "TASKS", "run_suite", "render_report", "main"]
 
 _PY = sys.executable
 
@@ -91,11 +85,6 @@ def _child_env() -> Dict[str, str]:
     """
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
-    # Windows 上管道子进程的 stdout 默认走 OEM/ANSI 代码页（常是 GBK），中文会被编码成
-    # GBK 字节；父进程按 utf-8 解码会得到乱码（U+FFFD），进而让「无匹配」这类判据失准。
-    # 强制子进程以 UTF-8 输出，跨平台稳定。
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
     return env
 
 
@@ -252,126 +241,6 @@ class EvalTask:
     prompt: str                                 # 发给 agent 的任务描述
     files: Dict[str, str] = field(default_factory=dict)   # 预置到任务目录的文件
     verify: Optional[Callable[[Path], Tuple[bool, str]]] = None
-    difficulty: str = "standard"                # 难度档：standard / hard（hard=长上下文改造等）
-
-
-# ----------------------------------------------------------------------------
-# hard 档基线模块（indexer 任务用）
-# ----------------------------------------------------------------------------
-# 注意：基线模块本身用单引号文档串、且不含 `"""`，因为下面要用三引号把整段
-# 源码包成字符串常量。评测的被测能力是"在它上面增量加 phrase_search 且不破坏既有方法"。
-_INDEXER_BASE = """# 微型倒排索引库（评测基线，不含 phrase_search）。
-# 只为评测提供"既有代码"：待测能力是在它上面增量加方法而不破坏其它。
-
-import re
-from collections import Counter
-
-_TOKEN_RE = re.compile(r"[A-Za-z]+")
-
-
-def tokenize(text):
-    '转小写、按字母词切分，返回词序列（不含空串）。'
-    return [m.group().lower() for m in _TOKEN_RE.finditer(text)]
-
-
-class InvertedIndex:
-    def __init__(self):
-        self._docs = {}
-        self._postings = {}
-
-    def add(self, doc_id, text):
-        toks = tokenize(text)
-        self._docs[doc_id] = toks
-        for t in toks:
-            self._postings.setdefault(t, set()).add(doc_id)
-
-    def remove(self, doc_id):
-        toks = self._docs.pop(doc_id, None)
-        if not toks:
-            return
-        for t in toks:
-            s = self._postings.get(t)
-            if s is not None:
-                s.discard(doc_id)
-                if not s:
-                    self._postings.pop(t, None)
-
-    def update(self, doc_id, text):
-        '同 id 覆盖：先 remove 再 add。'
-        self.remove(doc_id)
-        self.add(doc_id, text)
-
-    def search(self, term):
-        '单 term 检索，返回含该词的文档 id 集合。'
-        return set(self._postings.get(term.lower(), ()))
-
-    def search_all(self, *terms):
-        '所有 term 都出现（AND）。'
-        if not terms:
-            return set()
-        result = None
-        for t in terms:
-            s = set(self._postings.get(t.lower(), ()))
-            result = s if result is None else result & s
-        return result
-
-    def search_any(self, *terms):
-        '任一 term 出现（OR）。'
-        out = set()
-        for t in terms:
-            out |= set(self._postings.get(t.lower(), ()))
-        return out
-
-    def terms_of(self, doc_id):
-        '返回某文档去重后的词集合。'
-        return set(self._docs.get(doc_id, ()))
-
-    def frequency(self, term):
-        '文档频率：含该 term 的文档数。'
-        return len(self._postings.get(term.lower(), ()))
-
-    def top_terms(self, n=5):
-        '返回文档频率最高的前 n 个 term。'
-        return [t for t, _ in Counter(self._postings).most_common(n)]
-
-    def doc_count(self):
-        return len(self._docs)
-
-    def term_count(self):
-        return len(self._postings)
-"""
-
-# phrase_search 的验证器：既查既有方法没被改坏，也查新方法的顺序/连续性敏感。
-_INDEXER_VERIFY = _check_import("index", """
-from index import InvertedIndex, tokenize
-assert tokenize("Hello, World!") == ['hello', 'world'], 'tokenize 应转小写去标点'
-
-idx = InvertedIndex()
-idx.add(1, "the cat sat on the mat")
-idx.add(2, "the dog ate the cat food")
-idx.add(3, "cat and dog are friends")
-
-# —— 既有方法不能被改坏（"增量改造"题的核心判据）——
-assert idx.doc_count() == 3, 'doc_count 错'
-assert idx.term_count() >= 5, 'term_count 错'
-assert idx.search('cat') == {1, 2, 3}, 'search 应返回含 cat 的文档'
-assert idx.search_all('cat', 'dog') == {2, 3}, 'search_all 应为 AND'
-assert idx.search_any('cat', 'mat') == {1, 2, 3}, 'search_any 应为 OR'
-assert idx.frequency('the') == 2, 'frequency 算错'
-assert idx.top_terms(2), 'top_terms 应返回结果'
-
-# —— 新方法 phrase_search：顺序 + 连续敏感 ——
-assert idx.phrase_search('cat sat') == {1}, 'cat sat 连续，仅 doc1 命中'
-assert idx.phrase_search('the cat') == {1, 2}, 'the cat 连续出现在 doc1,doc2'
-assert idx.phrase_search('dog cat') == set(), '顺序相反不应命中'
-assert idx.phrase_search('dog food') == set(), 'dog 与 food 不连续，不应命中'
-assert idx.phrase_search('cat') == idx.search('cat'), '单 term 短语应等同 search'
-
-# —— 改动后既有行为仍一致 ——
-idx.remove(1)
-assert 1 not in idx.phrase_search('cat sat'), 'remove 后不应再命中'
-assert idx.search('cat') == {2, 3}, 'remove 后 search 也应同步'
-""")
 
 
 TASKS: List[EvalTask] = [
@@ -635,31 +504,6 @@ assert b.get('y').balance == 40, '失败的转账不该扣钱'
             ("不该把 WARN 行算进来", lambda out: "slow query" not in (out or "")),
         ]),
     ),
-
-    # ---- hard 档：在已有模块上增量改造（长上下文改造维度）------------------
-    EvalTask(
-        name="indexer",
-        intent="增量改造：加 order-sensitive phrase_search",
-        difficulty="hard",
-        prompt=(
-            "工作区已有 `index.py`（一个倒排索引库）。它已实现：\n"
-            "· `tokenize(text)` 转小写、按字母词切分；\n"
-            "· `InvertedIndex` 类，方法含 `add` / `remove` / `update` / `search`（单 term）/ "
-            "`search_all`（AND）/ `search_any`（OR）/ `terms_of` / `frequency` / "
-            "`top_terms` / `doc_count` / `term_count`。\n\n"
-            "请给 `InvertedIndex` **新增**一个 `phrase_search(phrase)` 方法：\n"
-            "返回**所有**出现该确切词序列（顺序一致、且连续）的文档 id 集合（set）。\n"
-            "它与 `search_all` 不同：`search_all('cat','dog')` 只要求两词都出现（可分散、可乱序），\n"
-            "而 `phrase_search('cat dog')` 要求 'cat' 紧跟着 'dog' 作为一个连续片段。\n\n"
-            "硬性约束：**保持其它所有方法的既有行为不变**（别为了加功能把 add/search 改坏）。\n"
-            "写完用 run_command 跑一段自测：构造 3 篇文档，验证\n"
-            "· 'cat sat' 只命中第 1 篇、'the cat' 命中第 1、2 篇；\n"
-            "· 'dog cat'（顺序相反）和 'dog food'（不连续）都**不**该命中任何文档；\n"
-            "· 删除一篇文档后，相关查询也不再命中它。"
-        ),
-        files={"index.py": _INDEXER_BASE},
-        verify=_INDEXER_VERIFY,
-    ),
 ]
 
 
@@ -679,7 +523,6 @@ class EvalOutcome:
     verify_ok: bool
     verify_msg: str
     error: str = ""
-    difficulty: str = "standard"     # 难度档，便于重复报告按档聚合
 
     @property
     def claimed_ok(self) -> bool:
@@ -733,7 +576,7 @@ def run_suite(
         if result is None:
             outcomes.append(EvalOutcome(
                 t.name, t.intent, "internal_error", 0, 0, 0, elapsed, 0,
-                False, "任务执行异常", error=err, difficulty=t.difficulty,
+                False, "任务执行异常", error=err,
             ))
         else:
             ok, msg = (False, "无验证器")
@@ -749,7 +592,7 @@ def run_suite(
                 rec.tool_errors if rec else result.errors,
                 elapsed,
                 rec.tokens if rec else 0,
-                ok, msg, error=err, difficulty=t.difficulty,
+                ok, msg, error=err,
             ))
 
         if on_progress:
@@ -877,89 +720,6 @@ def render_report(outcomes: List[EvalOutcome], *, model: str = "", elapsed: floa
 
 
 # ----------------------------------------------------------------------------
-# 重复运行：把"一次跑通"升级成"稳定跑通"
-# ----------------------------------------------------------------------------
-def _median(xs: List[float]) -> float:
-    """中位数。空列表返回 0.0（调用方保证传入非空时才有意义）。"""
-    if not xs:
-        return 0.0
-    s = sorted(xs)
-    n = len(s)
-    mid = n // 2
-    if n % 2:
-        return float(s[mid])
-    return (s[mid - 1] + s[mid]) / 2.0
-
-
-def render_repeat_report(
-    runs: List[List[EvalOutcome]], *, model: str = "", elapsed: float = 0.0
-) -> str:
-    """多次运行取分布：每任务通过率 + 步数/调用中位数，整体通过率 min/median/max。
-
-    `runs` 是 N 次完整运行的结果，每次是一份与 TASKS 同序的 EvalOutcome 列表。
-    这个函数**不依赖任何后端**，纯靠既有结果聚合——因此可以离线单测，
-    不必真的把 agent 跑 N 遍。
-
-    为什么需要它：单次结果会波动（随机采样、网关抖动）。一次 8/10 可能是运气，
-    三次 7/10、9/10、8/10 才说明"稳定在 8 成左右"。评测结论的可信度，
-    来自分布而不是单次读数。
-    """
-    n_runs = len(runs)
-    if n_runs == 0:
-        return "(无运行结果)"
-    tasks = runs[0]
-    n_tasks = len(tasks)
-
-    L: List[str] = []
-    L.append("=" * 78)
-    L.append(f"MiniCode 评测报告（重复 {n_runs} 次，取分布）")
-    L.append("=" * 78)
-    L.append(f"  模型：{model or '-'}    总耗时：{elapsed:.1f}s")
-    L.append("")
-    L.append("  判据：仍以产物验证为准。下列通过率 = N 次中产物通过的轮数占比，")
-    L.append("  中位数反映典型耗时/步数，" + ("N 轮样本小，方差仅供参考）。" if n_runs < 5
-             else "方差随轮数增大而稳定）。"))
-    L.append("")
-    L.append("  " + "-" * 74)
-    L.append("  " + _pad("任务", 10) + _pad("考察点", 24) + _pad("难度", 8, ">")
-             + _pad("通过率", 8, ">") + _pad("步med", 7, ">") + _pad("调用med", 8, ">"))
-    L.append("  " + "-" * 74)
-    for i in range(n_tasks):
-        name = tasks[i].task
-        intent = tasks[i].intent
-        diff = tasks[i].difficulty
-        col = [runs[r][i] for r in range(n_runs)]
-        passed = sum(1 for o in col if o.verify_ok)
-        rate = passed / n_runs if n_runs else 0.0
-        med_steps = _median([float(o.steps) for o in col])
-        med_calls = _median([float(o.tool_calls) for o in col])
-        L.append(
-            "  " + _pad(name, 10) + _pad(intent, 24) + _pad(diff, 8, ">")
-            + _pad(f"{rate * 100:.0f}%", 8, ">") + _pad(f"{med_steps:.0f}", 7, ">")
-            + _pad(f"{med_calls:.0f}", 8, ">")
-        )
-    L.append("  " + "-" * 74)
-
-    if n_tasks:
-        overall = [sum(1 for o in run if o.verify_ok) / n_tasks for run in runs]
-        rates = [r * 100 for r in overall]
-        L.append("")
-        L.append(f"  整体通过率分布：min {min(rates):.0f}%  "
-                 f"median {_median(rates):.0f}%  max {max(rates):.0f}%")
-        L.append(f"  单次通过率：{', '.join(f'{r * 100:.0f}%' for r in overall)}")
-        # 每档通过率：hard 档若明显低于 standard，说明区分度出来了
-        for tier in ("standard", "hard"):
-            tier_runs = [runs[r][i] for r in range(n_runs) for i in range(n_tasks)
-                         if tasks[i].difficulty == tier]
-            if tier_runs:
-                tp = sum(1 for o in tier_runs if o.verify_ok)
-                L.append(f"  · {tier} 档通过率：{tp}/{len(tier_runs)}"
-                         f"（{tp / len(tier_runs) * 100:.0f}%）")
-    L.append("=" * 78)
-    return "\n".join(L)
-
-
-# ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> int:
@@ -972,8 +732,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--task", help="只跑指定任务，逗号分隔（可选值：" + ",".join(t.name for t in TASKS) + "）")
     p.add_argument("--workspace", help="评测工作区（默认 workplace/_eval/<时间戳>）")
     p.add_argument("--max-steps", type=int, help="覆盖单任务步数上限")
-    p.add_argument("--repeat", type=int, default=1,
-                   help="每个任务重复运行 N 次取分布（中位数/方差）；默认 1")
     p.add_argument("--json", action="store_true", help="额外输出 JSON 结果，便于两次运行对比")
     p.add_argument("--quiet", action="store_true", help="不打印逐任务进度")
     args = p.parse_args(argv)
@@ -1011,44 +769,32 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"  [{mark}] {o.task:<10} {o.steps:>2}步 {o.tool_calls:>2}调用 "
                   f"{o.elapsed:>6.1f}s  {o.finish_reason:<14} {o.verify_msg[:60]}")
 
-    repeat = max(1, int(args.repeat))
-    print(f"\n评测开始：{len(tasks)} 个任务 × {repeat} 次，模型 {cfg.llm.model}，工作区 {ws}\n")
+    print(f"\n评测开始：{len(tasks)} 个任务，模型 {cfg.llm.model}，工作区 {ws}\n")
     started = time.time()
-    runs: List[List[EvalOutcome]] = []
-    for r in range(repeat):
-        run_ws = ws / f"run_{r}" if repeat > 1 else ws
-        run_ws.mkdir(parents=True, exist_ok=True)
-        outcomes = run_suite(
-            cfg.agent, cfg.llm, _backend, tasks, run_ws,
-            max_steps=args.max_steps, on_progress=(None if args.quiet else _progress),
-        )
-        runs.append(outcomes)
+    outcomes = run_suite(
+        cfg.agent, cfg.llm, _backend, tasks, ws,
+        max_steps=args.max_steps, on_progress=_progress,
+    )
     total = time.time() - started
 
     print()
-    if repeat > 1:
-        print(render_repeat_report(runs, model=cfg.llm.model, elapsed=total))
-    else:
-        print(render_report(runs[0], model=cfg.llm.model, elapsed=total))
+    print(render_report(outcomes, model=cfg.llm.model, elapsed=total))
 
     if args.json:
         payload = {
             "model": cfg.llm.model,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "elapsed": round(total, 2),
-            "repeat": repeat,
-            "verify_passed": sum(1 for o in runs[0] if o.verify_ok),
-            "total": len(runs[0]),
-            "runs": [[o.__dict__ for o in run] for run in runs],
+            "verify_passed": sum(1 for o in outcomes if o.verify_ok),
+            "total": len(outcomes),
+            "tasks": [o.__dict__ for o in outcomes],
         }
         out = ws / "eval-result.json"
         out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\nJSON 结果已写入：{out}")
 
-    # 退出码反映"产物验证"而非"模型自述"：所有运行的产物全部通过才是 0。
-    # 重复运行时任一 flakes 都会让退出码非零——这正是 --repeat 想暴露的稳定性信号。
-    all_ok = all(o.verify_ok for run in runs for o in run)
-    return 0 if all_ok else 1
+    # 退出码反映"产物验证"而非"模型自述"：全通过才是 0
+    return 0 if all(o.verify_ok for o in outcomes) else 1
 
 
 if __name__ == "__main__":

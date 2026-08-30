@@ -227,27 +227,12 @@ def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         )
     parts.append(f"[exit code: {exit_code}]")
 
-    # 工具是否"正常执行完"：只要命令被成功拉起、拿到了输出，就算工具成功——
-    # 哪怕命令自己以非 0 退出（pytest 失败、assert 触发）也是一次**有效的验证结果**，
-    # 不是工具出错。真正的工具错误只有：超时、疑似等待输入被杀、进程根本起不来
-    # （后者在前面以 ToolError 抛出，经 registry 转成 ok=False 回执）。
-    # command_failed 显式标记"命令自身失败（非 0 退出）"，供主循环区分
-    # "验证没过"（应计入自修复素材、但不算工具失败率）与"工具真出错"。
-    command_failed = (exit_code != 0)
-    ok = not timed_out and not interactive_killed
+    ok = (exit_code == 0) and not timed_out and not interactive_killed
     result = ToolResult.success(
         "\n".join(parts),
-        meta={
-            "exit_code": exit_code,
-            "timed_out": timed_out,
-            "interactive_killed": interactive_killed,
-            "command_failed": command_failed,
-            "cwd": str(cwd),
-        },
+        meta={"exit_code": exit_code, "timed_out": timed_out, "interactive_killed": interactive_killed, "cwd": str(cwd)},
     )
     result.ok = ok
-    # 仅真正的工具错误才把内容挪到 error 并清空 output；
-    # 命令非 0 退出时保留 output（测试日志是模型修复的依据）。
     if not ok:
         result.error = "\n".join(parts)
         result.output = ""

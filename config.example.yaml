@@ -22,7 +22,7 @@ profiles:
     base_url: "https://maas.nscc-cs.cn/external/api/v1"
     api_key: "${NSCC_API_KEY}"
     api_keys: []                      # 例：["${NSCC_API_KEY_2}", "${NSCC_API_KEY_3}"]
-    model: "hy3"
+    model: "Qwen3.5"
     temperature: 0.2
     max_tokens: 8192
     timeout: 180
