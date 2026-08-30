@@ -2389,6 +2389,37 @@ def test_replace_in_file_global_replaces_all():
         assert (base / "m.py").read_text(encoding="utf-8") == "x = NEW\ny = NEW\nz = NEW\n"
 
 
+def test_git_tool_rejects_dangerous_and_runs_safe():
+    import subprocess
+    import unittest.mock as mock
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None, command_timeout=30)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        # 危险 / 未知子命令必须被拒绝（不真正执行）
+        rp = registry.execute("git", {"args": "push origin main"}, ctx)
+        assert not rp.ok, "push 必须被禁止"
+        rr = registry.execute("git", {"args": "reset --hard"}, ctx)
+        assert not rr.ok, "reset --hard 必须被禁止"
+        rk = registry.execute("git", {"args": "frobnicate"}, ctx)
+        assert not rk.ok, "未知子命令必须被拒绝"
+
+        # 安全只读命令：用假 subprocess 验证分发逻辑（不依赖本机是否装 git）
+        def fake_run(cmd, **kw):
+            assert cmd[0] == "git"
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"fake git {cmd[1]} ok", stderr="")
+
+        with mock.patch("agent.tools.git_tool.subprocess.run", fake_run):
+            rs = registry.execute("git", {"args": "status --short"}, ctx)
+            assert rs.ok and "fake git status" in rs.output, rs.render()
+            rl = registry.execute("git", {"args": "log -5"}, ctx)
+            assert rl.ok and "fake git log" in rl.output
+
+
 def test_eval_task_suite_is_stdlib_only_and_deterministic():
     """任务套件的基本卫生：有验证器、有考察点、预置文件齐全。
 
