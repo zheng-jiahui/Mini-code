@@ -12,8 +12,12 @@
 
 from __future__ import annotations
 
+import html as _html
+import re
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from ..errors import ToolError
 from ..security import truncate_output
@@ -180,4 +184,99 @@ def replace_in_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 
 def register(registry) -> None:
-    registry.register_many([read_many_files, replace_in_file])
+    registry.register_many([read_many_files, replace_in_file, web_fetch])
+
+
+# ----------------------------------------------------------------------------
+# web_fetch —— 自实现抓取（仅用标准库，符合「不自用服务端工具」的要求）
+# ----------------------------------------------------------------------------
+_MAX_BYTES = 1_000_000  # 最多拉 1MB，避免大页面把上下文撑爆
+_UA = "MiniCode/1.0 (+https://github.com/)"
+
+
+def _fetch(url: str, timeout: float) -> Tuple[bytes, str]:
+    """用标准库抓取 URL，返回 (原始字节, content-type)。任何网络错误都上抛。"""
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - 仅允许 http/https
+        ctype = getattr(resp, "headers", None)
+        ctype = ctype.get_content_type() if ctype else "text/html"
+        return resp.read(_MAX_BYTES), ctype
+
+
+def _html_to_text(html_bytes: bytes) -> str:
+    """极简 HTML → 纯文本：去 script/style，去掉标签，还原常见实体，折叠空白。"""
+    text = html_bytes.decode("utf-8", errors="replace")
+    text = re.sub(r"(?is)<script\b.*?</script>", " ", text)
+    text = re.sub(r"(?is)<style\b.*?</style>", " ", text)
+    text = re.sub(r"(?is)<head\b.*?</head>", " ", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = _html.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+@tool_spec(
+    name="web_fetch",
+    description=(
+        "抓取一个网址（仅 http/https）并返回可读文本，用于阅读文档、RFC、API 说明、报错页等。"
+        "纯标准库自实现，不依赖任何服务端代码执行工具。返回内容会被截断以适配上下文。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "要抓取的网址，必须以 http:// 或 https:// 开头"},
+            "max_chars": {"type": "integer", "description": "返回文本最多多少字符，默认 20000", "default": 20000},
+        },
+        "required": ["url"],
+    },
+    category="检索",
+    when_not_to_use=(
+        "要读的文档已经在本地工作区里，用 read_file / grep_search 即可，别去网上抓。"
+        "只接受公开 http/https 页面；file://、ftp://、内网地址、需要登录的页面都不要抓。"
+        "抓取到的内容仅作参考，关键信息仍要以你本地验证过的为准。"
+    ),
+)
+def web_fetch(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    url = (args.get("url") or "").strip()
+    if not url:
+        raise ToolError("url 不能为空", tool="web_fetch")
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        raise ToolError(
+            f"仅支持 http/https 网址，收到：{url}",
+            tool="web_fetch",
+            hint="file:// / ftp:// / 内网地址 / 需要登录的页面都不要抓。",
+        )
+
+    timeout = float(getattr(ctx.config, "command_timeout", 120))
+    try:
+        raw, ctype = _fetch(url, timeout)
+    except urllib.error.HTTPError as exc:
+        return ToolResult.failure(
+            f"抓取 {url} 失败：HTTP {exc.code}",
+            hint="目标页面可能不存在或拒绝访问；检查 URL 是否正确。",
+            meta={"http_code": exc.code},
+        )
+    except urllib.error.URLError as exc:
+        return ToolResult.failure(
+            f"抓取 {url} 失败：{exc.reason}",
+            hint="可能是网络不可达、DNS 失败或地址被墙；确认网络与 URL。",
+        )
+    except ValueError as exc:
+        return ToolResult.failure(f"URL 非法：{exc}", tool="web_fetch")
+    except OSError as exc:
+        return ToolResult.failure(f"抓取 {url} 时发生网络错误：{exc}")
+
+    # 文本类（含 markdown/json/xml）原样保留；HTML 抽成纯文本
+    if "html" in (ctype or "") and not url.rstrip().lower().endswith((".md", ".txt", ".json", ".xml")):
+        text = _html_to_text(raw)
+    else:
+        text = raw.decode("utf-8", errors="replace")
+
+    max_chars = int(args.get("max_chars") or 20_000)
+    if len(text) > max_chars:
+        text = truncate_output(text, max_chars, note="网页内容过长")
+    return ToolResult.success(
+        f"已抓取 {url}（类型 {ctype or '未知'}）：\n{text}",
+        meta={"url": url, "content_type": ctype, "chars": len(text)},
+    )

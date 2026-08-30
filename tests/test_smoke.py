@@ -2420,6 +2420,50 @@ def test_git_tool_rejects_dangerous_and_runs_safe():
             assert rl.ok and "fake git log" in rl.output
 
 
+def test_web_fetch_strips_html_and_rejects_bad_scheme():
+    import io
+    import urllib.request
+    import urllib.error
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None, command_timeout=30)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        # 非 http(s) 必须拒绝
+        rb = registry.execute("web_fetch", {"url": "file:///etc/passwd"}, ctx)
+        assert not rb.ok
+        rn = registry.execute("web_fetch", {"url": "ftp://example.com/x"}, ctx)
+        assert not rn.ok
+
+        # 模拟一次成功抓取（HTML 应被抽成纯文本）
+        html = b"<html><head><title>t</title></head><body><script>var a=1;</script><p>Hello <b>World</b></p></body></html>"
+        fake_resp = io.BytesIO(html)
+        fake_resp.headers = type("H", (), {"get_content_type": lambda self: "text/html"})()
+
+        def fake_open(req, timeout=0):
+            return fake_resp
+
+        with __import__("unittest.mock", fromlist=["mock"]).patch(
+                "agent.tools.extra.urllib.request.urlopen", fake_open):
+            r = registry.execute("web_fetch", {"url": "https://example.com/"}, ctx)
+        assert r.ok, r.render()
+        assert "Hello World" in r.output, r.output
+        assert "<script>" not in r.output and "<b>" not in r.output, "HTML 标签应被剥离"
+        assert "var a=1" not in r.output, "script 内容应被去除"
+
+        # 模拟 HTTP 404
+        def fake_404(req, timeout=0):
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
+
+        with __import__("unittest.mock", fromlist=["mock"]).patch(
+                "agent.tools.extra.urllib.request.urlopen", fake_404):
+            r4 = registry.execute("web_fetch", {"url": "https://example.com/missing"}, ctx)
+        assert not r4.ok and "404" in r4.render()
+
+
 def test_eval_task_suite_is_stdlib_only_and_deterministic():
     """任务套件的基本卫生：有验证器、有考察点、预置文件齐全。
 
