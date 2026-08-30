@@ -2334,6 +2334,13 @@ def test_eval_task_suite_is_stdlib_only_and_deterministic():
 
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
+    # 失败信息里可能含非常规字符（如 U+FFFD 乱码）；在 GBK 控制台上直接 print 会触发
+    # UnicodeEncodeError 并掩盖真实错误。先让 stdout/stderr 以 replace 容错输出。
+    try:
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
     failures = 0
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

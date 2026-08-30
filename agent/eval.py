@@ -85,6 +85,11 @@ def _child_env() -> Dict[str, str]:
     """
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
+    # Windows 上管道子进程的 stdout 默认走 OEM/ANSI 代码页（常是 GBK），中文会被编码成
+    # GBK 字节；父进程按 utf-8 解码会得到乱码（U+FFFD），进而让「无匹配」这类判据失准。
+    # 强制子进程以 UTF-8 输出，跨平台稳定。
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     return env
 
 
