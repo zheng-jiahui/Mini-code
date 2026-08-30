@@ -2589,6 +2589,52 @@ def test_memory_notes_injected_into_system_prompt():
         assert "提交前必须跑测试" in loop.system_prompt
 
 
+def test_fs_ops_move_copy_delete():
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        (Path(tmp) / "a.txt").write_text("hello", encoding="utf-8")
+
+        # move a -> b
+        r = registry.execute("move_file", {"src": "a.txt", "dst": "b.txt"}, ctx)
+        assert r.ok and (Path(tmp) / "b.txt").exists() and not (Path(tmp) / "a.txt").exists()
+
+        # copy b -> c
+        r2 = registry.execute("copy_file", {"src": "b.txt", "dst": "c.txt"}, ctx)
+        assert r2.ok and (Path(tmp) / "c.txt").read_text(encoding="utf-8") == "hello"
+
+        # 覆盖保护：无 overwrite 失败
+        r3 = registry.execute("move_file", {"src": "b.txt", "dst": "c.txt"}, ctx)
+        assert not r3.ok, "目标已存在时应拒绝"
+        # 传 overwrite=true 成功
+        r4 = registry.execute("move_file", {"src": "b.txt", "dst": "c.txt", "overwrite": True}, ctx)
+        assert r4.ok and (Path(tmp) / "c.txt").exists() and not (Path(tmp) / "b.txt").exists()
+
+        # delete c（应备份）
+        r5 = registry.execute("delete", {"path": "c.txt"}, ctx)
+        assert r5.ok and not (Path(tmp) / "c.txt").exists()
+        backups = list(Path(tmp).parent.glob(".agent_backups/.overwrites/*/*/c.txt"))
+        assert backups, "删除前应已备份到 .agent_backups"
+
+        # 目录删除需 recursive
+        d = Path(tmp) / "sub"
+        d.mkdir()
+        (d / "x.txt").write_text("x", encoding="utf-8")
+        rd = registry.execute("delete", {"path": "sub"}, ctx)
+        assert not rd.ok, "删目录缺 recursive 应拒绝"
+        rdr = registry.execute("delete", {"path": "sub", "recursive": True}, ctx)
+        assert rdr.ok and not d.exists()
+
+        # 越界拒绝
+        re = registry.execute("delete", {"path": "../escape.txt"}, ctx)
+        assert not re.ok, "越界路径应拒绝"
+
+
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0

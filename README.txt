@@ -23,9 +23,10 @@
 1. 零框架：未使用 LangChain / LlamaIndex / OpenAI Agents SDK / AutoGen / CrewAI 等任何 Agent 框架，
    仅用 OpenAI 兼容聊天补全客户端；对话历史、工具、解析、循环、压缩、错误全部自写。
 2. 双通道工具调用：优先原生 function calling；模型/网关不支持时自动切换 ```json 文本协议 + 自写解析校验纠错。
-3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环（共 20 个）：
+3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环（共 23 个）：
    read_file / write_file / edit_block / apply_patch / read_many_files / replace_in_file /
-   list_dir / run_command / grep_search(支持上下文) / find_files / web_fetch / diff /
+   move_file / copy_file / delete(删前备份) / list_dir / run_command /
+   grep_search(支持上下文) / find_files / web_fetch / diff /
    git(安全只读) / plan / finish / ask_user / rollback / todo(任务清单) / think(推理便签) /
    memory(项目记忆)。
 4. 上下文治理：tiktoken 精确 token 计数 + 工具回执智能压缩（信号行优先）+ 超阈值摘要压缩兜底；
@@ -45,6 +46,8 @@
    web_fetch 自读在线文档/RFC/API 说明、安全 git 只读版本控制、think 推理便签；一轮内多个只读调用并行发出。
 14. 跨会话项目记忆：memory 工具把「约定/踩坑/选型」落盘 .minicode/memory.md，启动时自动注入
     system 提示词（类比 CLAUDE.md/AGENTS.md），下次会话免从零探索，且可 append 持续积累。
+15. 文件增删齐备：move_file/copy_file/delete 补足文件的移动/复制/删除；delete 删前先备份到
+    .agent_backups 可恢复，删目录需 recursive=true，越界路径一律拒绝。
 
 三、其它
 - 架构图、System Prompt、工具规范、接口与错误分层见 docs/DESIGN.md。
