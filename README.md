@@ -73,6 +73,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 │       ├── filesystem.py     # read_file / write_file / edit_block / list_dir
 │       ├── shell.py          # run_command
 │       ├── search.py         # grep_search（支持 context 上下文）/ find_files
+│       ├── recall.py         # recall：按相关度检索最相关文件与片段（模糊意图定位）
 │       ├── patch.py          # apply_patch（自实现 unified diff 应用器，不依赖外部 patch/git）
 │       ├── repair.py         # rollback（整目录 / 单文件级回退到历史快照）
 │       ├── review.py         # build_diff：本次会话改动的 unified diff
@@ -90,7 +91,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 
 | 能力 | 说明 |
 |---|---|
-| 工具（共 23 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file` `move_file` `copy_file` `delete`；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch`；执行：`run_command`；版本控制：`git`（受控提交 + 只读 + add）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签）`memory`（项目记忆） |
+| 工具（共 24 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file` `move_file` `copy_file` `delete`；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch` `recall`（相关文件检索）；执行：`run_command`；版本控制：`git`（受控提交 + 只读 + add）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签）`memory`（项目记忆） |
 | 双通道调用 | 优先原生 `tool_calls`；模型不支持时自动切到 ```json 文本协议 |
 | 上下文管理 | token 估算 → 工具回执智能压缩（信号行优先）→ 超阈值摘要压缩 → 硬截断兜底 |
 | 长程记忆 | **常驻事实层**：硬约束/技术选型/已失败方案常驻且不参与再压缩，避免"摘要的摘要"式衰减；压缩后重建工作区真实清单 |
@@ -109,6 +110,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 | 推理便签 | `think` 把推理 / 计划固定进上下文，长任务保持思路、便利用户审阅思考过程 |
 | 项目记忆 | `memory` 跨会话持久沉淀「项目约定 / 踩过的坑 / 已定选型」（落盘 `.minicode/memory.md`），启动时自动注入 system 提示词，下次会话免从零探索 |
 | 文件增删 | `move_file` / `copy_file` / `delete` 补足文件的移动 / 复制 / 删除；`delete` 删除前先备份到 `.agent_backups` 可恢复，删目录需 `recursive=true` |
+| 相关文件检索 | `recall` 给定一段模糊意图（如「登录失败重试」「导出 CSV」），按相关度排序找回最相关的若干文件并给出最相关的几行片段；模型不必知道确切函数名也能先定位（类比 Cursor/Claude Code 的 find relevant code），一轮内可与其他只读工具并行 |
 
 ---
 

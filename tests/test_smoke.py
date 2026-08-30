@@ -2695,6 +2695,63 @@ def test_fs_ops_move_copy_delete():
         assert not re.ok, "越界路径应拒绝"
 
 
+def test_recall_ranks_relevant_files():
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        # recall 必须已注册且可见
+        assert "recall" in registry.names()
+
+        (Path(tmp) / "auth.py").write_text(
+            "def handle_login(user):\n"
+            "    for attempt in range(3):\n"
+            "        try:\n"
+            "            do_login(user)\n"
+            "        except LoginError:\n"
+            "            continue  # 登录失败重试\n"
+            "    return None\n",
+            encoding="utf-8",
+        )
+        # 部分相关：只命中查询里的「登录」一词，应排在 auth.py 之后
+        (Path(tmp) / "session.py").write_text(
+            "class Session:\n    def login(self):  # 仅含登录一词\n        return self.token\n",
+            encoding="utf-8",
+        )
+        (Path(tmp) / "utils.py").write_text(
+            "def format_number(n):\n    return f'{n:,}'\n",
+            encoding="utf-8",
+        )
+        (Path(tmp) / "readme.md").write_text(
+            "# 项目说明\n这是一个示例项目。\n",
+            encoding="utf-8",
+        )
+
+        # 模糊意图应命中相关文件，且最相关的排在最前
+        r = registry.execute("recall", {"query": "登录失败重试", "top_k": 3}, ctx)
+        assert r.ok, r.render()
+        assert "auth.py" in r.output, "最相关文件应为 auth.py"
+        assert "session.py" in r.output, "部分相关的 session.py 也应被召回"
+        assert "utils.py" not in r.output and "readme.md" not in r.output, "无关文件不应被召回"
+        assert r.output.index("auth.py") < r.output.index("session.py"), "auth.py 应排在 session.py 之前"
+
+        # 片段应带行号并标记相关度
+        assert "相关度" in r.output and "1  " in r.output
+        assert r.meta.get("matches") == 2, "应召回 2 个相关文件"
+
+        # 空查询必须报错
+        re_ = registry.execute("recall", {"query": "   "}, ctx)
+        assert not re_.ok, "空查询必须被拒绝"
+
+        # 无相关文件：友好返回（ok=True，但 0 命中）
+        r2 = registry.execute("recall", {"query": "量子纠缠超导"}, ctx)
+        assert r2.ok and "未找到" in r2.output
+
+
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
