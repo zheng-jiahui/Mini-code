@@ -2464,6 +2464,20 @@ def test_web_fetch_strips_html_and_rejects_bad_scheme():
         assert not r4.ok and "404" in r4.render()
 
 
+def test_think_tool_echoes_reasoning():
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+        r = registry.execute("think", {"thought": "先读 main.py 再决定怎么改"}, ctx)
+        assert r.ok and "[便签]" in r.output and "先读 main.py" in r.output
+        # 空 thought 应被拒绝
+        re_ = registry.execute("think", {"thought": ""}, ctx)
+        assert not re_.ok
+
+
 def test_eval_task_suite_is_stdlib_only_and_deterministic():
     """任务套件的基本卫生：有验证器、有考察点、预置文件齐全。
 

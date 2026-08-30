@@ -184,7 +184,37 @@ def replace_in_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 
 def register(registry) -> None:
-    registry.register_many([read_many_files, replace_in_file, web_fetch])
+    registry.register_many([read_many_files, replace_in_file, web_fetch, think])
+
+
+# ----------------------------------------------------------------------------
+# think —— 推理便签
+# ----------------------------------------------------------------------------
+@tool_spec(
+    name="think",
+    description=(
+        "把你的推理 / 计划 / 顾虑写进「便签」，工具会把内容原样回显给你自己看，"
+        "便于在长任务里保持思路清晰、也方便用户事后审阅你的思考过程。"
+        "它**不改变文件、不执行命令**，只是把一段思考固定进上下文。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "thought": {"type": "string", "description": "要记录的思考内容：下一步计划、关键约束、已排除的方案、对需求的假设等"},
+        },
+        "required": ["thought"],
+    },
+    category="控制",
+    when_not_to_use=(
+        "别把「真正要执行的动作」写进便签——读文件 / 改代码 / 跑测试要用对应工具，便签只是「先想清楚」。"
+        "也别把便签当聊天；重要的决定最终要落到 todo / plan 或实际改动上，而不是停在空想。"
+    ),
+)
+def think(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    text = (args.get("thought") or "").strip()
+    if not text:
+        raise ToolError("thought 不能为空", tool="think")
+    return ToolResult.success(f"[便签] {text}", meta={"chars": len(text)})
 
 
 # ----------------------------------------------------------------------------
