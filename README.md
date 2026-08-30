@@ -28,7 +28,7 @@ python run.py --list-tools                     # 查看全部工具
 **跑一次能力评测**（真实端点，约 40 秒）：
 
 ```bash
-python -m agent.eval                           # 5 个标准任务，以产物验证为准
+python -m agent.eval                           # 10 个标准任务，以产物验证为准
 python -m agent.eval --task calc,dedup --json  # 只跑指定任务 / 落盘 JSON
 ```
 
@@ -67,16 +67,19 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 │   ├── selfrepair.py         # 自修复感知层：测试命令识别、traceback 定位（纯函数）
 │   ├── metrics.py            # 质量指标：结局分布 / 自修复回合 / 返工
 │   ├── checkpoint.py         # 会话检查点：跨进程续跑
-│   ├── eval.py               # 评测台：5 个标准任务，验证产物
+│   ├── eval.py               # 评测台：10 个标准任务，验证产物
 │   └── tools/
 │       ├── base.py           # ToolSpec / ToolRegistry / ToolResult（自建工具系统）
 │       ├── filesystem.py     # read_file / write_file / edit_block / list_dir
 │       ├── shell.py          # run_command
-│       ├── search.py         # grep_search / find_files
+│       ├── search.py         # grep_search（支持 context 上下文）/ find_files
 │       ├── patch.py          # apply_patch（自实现 unified diff 应用器，不依赖外部 patch/git）
 │       ├── repair.py         # rollback（整目录 / 单文件级回退到历史快照）
 │       ├── review.py         # build_diff：本次会话改动的 unified diff
-│       └── meta.py           # finish / ask_user / plan
+│       ├── meta.py           # finish / ask_user / plan
+│       ├── todo.py           # todo：可追踪状态的任务清单
+│       ├── extra.py          # read_many_files / replace_in_file / web_fetch / think
+│       └── git_tool.py       # git：安全只读版本控制（白名单 + 拦截高危操作）
 ├── docs/DESIGN.md            # 完整设计说明（主循环流程图、接口定义、错误策略等）
 └── tests/                    # 冒烟测试（Mock 后端，无需 API key）
 ```
@@ -87,7 +90,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 
 | 能力 | 说明 |
 |---|---|
-| 工具 | `read_file` `write_file` `list_dir` `run_command` `grep_search` `find_files` `finish` `ask_user` |
+| 工具（共 19 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file`；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch`；执行：`run_command`；版本控制：`git`（安全只读 + add）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签） |
 | 双通道调用 | 优先原生 `tool_calls`；模型不支持时自动切到 ```json 文本协议 |
 | 上下文管理 | token 估算 → 工具回执智能压缩（信号行优先）→ 超阈值摘要压缩 → 硬截断兜底 |
 | 长程记忆 | **常驻事实层**：硬约束/技术选型/已失败方案常驻且不参与再压缩，避免"摘要的摘要"式衰减；压缩后重建工作区真实清单 |
@@ -97,7 +100,13 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 | 安全 | 工作区路径沙箱、危险命令拦截/二次确认、命令超时（带上限夹取）、写前自动备份 |
 | 可观测 | 每步打印「思考 / 工具调用 / 结果 / 耗时」，流式输出，`/diff` 审阅改动、`/stats` 成本与瓶颈面板，会话可存 JSONL 复盘 |
 | 质量指标 | `/stats` 也回答"做对了没有"：结局分布、失败率、自修复回合数、返工 |
-| 评测台 | `python -m agent.eval`：5 个标准任务，**以产物能否跑通为准**（不采信模型自述），并标出假完成 / 悲观失败 |
+| 评测台 | `python -m agent.eval`：10 个标准任务，**以产物能否跑通为准**（不采信模型自述），并标出假完成 / 悲观失败 |
+| 任务清单 | `todo` 维护可勾选的待办清单，长任务里防漏做 / 防过早收尾 |
+| 批量读取 | `read_many_files` 一次看清多个相关文件，省掉多轮往返 |
+| 全局替换 | `replace_in_file` 把所有同名旧符号统一换成新的（区别于 `edit_block` 的唯一匹配） |
+| 网页抓取 | `web_fetch` 用标准库自实现抓取 http/https 页面并剥离 HTML，让 agent 能自己读文档 / RFC / API 说明 |
+| 安全 git | `git` 白名单只读 + 暂存，机制上拦截 push / reset --hard / commit 等高危操作，避免误破坏仓库 |
+| 推理便签 | `think` 把推理 / 计划固定进上下文，长任务保持思路、便利用户审阅思考过程 |
 
 ---
 

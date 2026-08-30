@@ -16,16 +16,17 @@
    workplace/任务名/                          该任务的最新代码
    .agent_backups/任务名_时间戳_第N次/        每次生成的完整归档，序号自动递增
    .overwrites/                              覆盖写单文件备份，供 /undo 回滚
-5) 测试：python tests/test_smoke.py（68 个用例，无需 API key）
+5) 测试：python tests/test_smoke.py（107 个用例，无需 API key）
         python tests/test_fake_server.py（本地假服务端，验证 HTTP 协议链路）
 
 二、特色功能
 1. 零框架：未使用 LangChain / LlamaIndex / OpenAI Agents SDK / AutoGen / CrewAI 等任何 Agent 框架，
    仅用 OpenAI 兼容聊天补全客户端；对话历史、工具、解析、循环、压缩、错误全部自写。
 2. 双通道工具调用：优先原生 function calling；模型/网关不支持时自动切换 ```json 文本协议 + 自写解析校验纠错。
-3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环；含
-   read_file / write_file / edit_block / apply_patch / list_dir / run_command / grep_search /
-   find_files / diff / plan / finish / ask_user / rollback。
+3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环（共 19 个）：
+   read_file / write_file / edit_block / apply_patch / read_many_files / replace_in_file /
+   list_dir / run_command / grep_search(支持上下文) / find_files / web_fetch / diff /
+   git(安全只读) / plan / finish / ask_user / rollback / todo(任务清单) / think(推理便签)。
 4. 上下文治理：tiktoken 精确 token 计数 + 工具回执智能压缩（信号行优先）+ 超阈值摘要压缩兜底；
    /stats 面板报真实 token、各工具耗时占比与时间去向（实测等模型约九成，瓶颈一目了然）。
 5. 循环控制：步数/连续失败上限、重复调用指纹去重、解析纠错回灌、Ctrl-C 保留历史。
@@ -39,6 +40,8 @@
    plan 工具支持复杂任务"先列计划再执行"；一轮内的多个只读调用（read/grep/list/diff）并行发出，缩短等待。
 12. 改动落地更全：apply_patch 工具把标准 unified diff 落到已存在文件（多 hunk、上下文匹配容错、
    任一 hunk 对不上即整体失败不写盘），不依赖外部 patch/git 二进制；diff 工具与之配合可"先看改动再打补丁"。
+13. 更贴近商业 code agent：todo 任务清单防漏做、read_many_files 批量读、replace_in_file 全局替换、
+   web_fetch 自读在线文档/RFC/API 说明、安全 git 只读版本控制、think 推理便签；一轮内多个只读调用并行发出。
 
 三、其它
 - 架构图、System Prompt、工具规范、接口与错误分层见 docs/DESIGN.md。
