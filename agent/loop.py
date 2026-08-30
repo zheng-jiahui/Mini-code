@@ -623,10 +623,16 @@ class AgentLoop:
             # 自修复闭环：run_command 失败时，把「出错位置 + 附近源码」直接回灌给模型，
             # 省掉它多一轮 read_file；连续失败达到预算时提醒停止乱试、考虑回滚。
             if call.name == "run_command":
-                # 质量指标：run_command 是 agent 唯一的"验证手段"，它的成败序列
-                # 就是自修复能力的原始素材（怎么切分回合见 metrics._repair_stats）。
-                self.metrics.record_verify(tool_result.ok)
-                if tool_result.ok:
+                # 质量指标口径（V12 修正）：run_command 是 agent 唯一的"验证手段"。
+                # 命令以非 0 退出（pytest 失败、assert 触发）是**一次有效的验证**，
+                # 应记入自修复序列并回灌出错位置，但**不算工具出错**——工具出错只指
+                # 超时 / 疑似等待输入 / 进程起不来。否则"工具失败率"会被正常验证失败
+                # 污染，建立在错误读数上的调优毫无意义（见 ITERATION-PLAN 下一轮建议 #1）。
+                verified = bool(tool_result.ok) and not bool(
+                    tool_result.meta.get("command_failed", False)
+                )
+                self.metrics.record_verify(verified)
+                if verified:
                     self._consecutive_run_failures = 0
                 else:
                     self._on_command_failure(tool_result)

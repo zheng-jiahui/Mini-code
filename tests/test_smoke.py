@@ -536,6 +536,29 @@ def test_interactive_command_is_killed_early():
         assert r.meta.get("timed_out") is False
 
 
+def test_run_command_nonzero_exit_is_tool_success_but_command_failure():
+    """命令以非 0 退出（pytest 失败 / assert 触发）是验证结果，不是工具出错。
+
+    回归 V12 指标口径修正：run_command 只要把命令拉起来、拿到输出就算工具成功
+    （ok=True），并用 meta['command_failed'] 标出"命令自身失败"；真正的工具错误
+    只指超时 / 疑似等待输入 / 进程起不来（ok=False）。这样"工具失败率"才不会被
+    正常的验证失败污染。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, _profile, registry, ctx = _make_env(tmp)
+        r = registry.execute("run_command", {
+            "command": 'python -c "print(\'FAIL-LINE\'); import sys; sys.exit(1)"'
+        }, ctx)
+        assert r.ok is True, r.render()
+        assert r.meta.get("command_failed") is True
+        assert "FAIL-LINE" in (r.output or ""), "非 0 退出的输出应保留，供模型修复"
+        r0 = registry.execute("run_command", {
+            "command": 'python -c "print(\'OK-LINE\')"'
+        }, ctx)
+        assert r0.ok is True
+        assert r0.meta.get("command_failed") is False
+
+
 def test_fake_finish_blocked_until_verified():
     """改了文件却没跑过命令就 finish → 被拦截逼它先验证，跑过命令后才允许收尾。"""
     with tempfile.TemporaryDirectory() as tmp:
@@ -714,7 +737,7 @@ def test_self_repair_feeds_traceback_context_and_recovers():
         loop = AgentLoop(cfg, profile, backend, registry, console=None)
         result = loop.run("写个除法函数")
         assert result.finish_reason == "finish", result.finish_reason
-        assert result.errors == 1, f"第一次运行必须真的失败，实际 errors={result.errors}"
+        assert result.errors == 0, "命令非 0 退出是验证结果而非工具出错；工具失败率口径已在 V12 修正"
 
         joined = "\n".join(str(m.get("content", "")) for m in loop.history.messages)
         assert "运行失败" in joined, "失败后应回灌自修复提示"
@@ -1903,7 +1926,7 @@ def test_quality_metrics_record_a_repair_round_end_to_end():
         loop = AgentLoop(cfg, profile, backend, registry, console=None)
         result = loop.run("写个除法函数")
         assert result.finish_reason == "finish", result.finish_reason
-        assert result.errors == 1, f"第一次运行必须真的失败，实际 errors={result.errors}"
+        assert result.errors == 0, "命令非 0 退出是验证结果而非工具出错；工具失败率口径已在 V12 修正"
 
         rec = loop.metrics.tasks[-1]
         assert rec.verify_runs == 2, rec.verify_runs
