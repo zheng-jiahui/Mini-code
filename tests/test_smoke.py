@@ -2420,6 +2420,66 @@ def test_git_tool_rejects_dangerous_and_runs_safe():
             assert rl.ok and "fake git log" in rl.output
 
 
+def test_git_tool_controlled_commit_requires_message_and_rejects_dangerous():
+    import subprocess
+    import unittest.mock as mock
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None, command_timeout=30)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        # 有暂存区（允许提交走下去）
+        def fake_run_staged(cmd, **kw):
+            assert cmd[0] == "git"
+            if cmd[1:4] == ["diff", "--cached", "--name-only"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="src/main.py\n", stderr="")
+            if cmd[1] == "commit":
+                assert "-m" in cmd, "commit 必须带 -m"
+                return subprocess.CompletedProcess(cmd, 0, stdout="[main abc123] done", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"fake git {cmd[1]} ok", stderr="")
+
+        # 空暂存区（应被拦截）
+        def fake_run_empty(cmd, **kw):
+            assert cmd[0] == "git"
+            if cmd[1:4] == ["diff", "--cached", "--name-only"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="should not happen", stderr="")
+
+        # 1) 无提交信息必须被拒绝（args 内无 -m）
+        rn = registry.execute("git", {"args": "commit"}, ctx)
+        assert not rn.ok, "commit 无 -m 必须被拒绝"
+
+        # 2) 空 -m 必须被拒绝
+        re_ = registry.execute("git", {"args": "commit -m \"\""}, ctx)
+        assert not re_.ok, "commit 空 -m 必须被拒绝"
+
+        # 3) 改写历史的选项必须被拒绝
+        for bad in ("commit --amend -m x", "commit --no-verify -m x",
+                    "commit -a -m x", "commit --allow-empty -m x", "commit --date=now -m x"):
+            rb = registry.execute("git", {"args": bad}, ctx)
+            assert not rb.ok, f"commit 危险选项应被拒绝：{bad}"
+
+        # 4) 合法 commit（args 内带 -m）
+        with mock.patch("agent.tools.git_tool.subprocess.run", fake_run_staged):
+            rk = registry.execute("git", {"args": "commit -m 'fix: bug'"}, ctx)
+            assert rk.ok, rk.render()
+            assert "[main abc123] done" in rk.output
+
+        # 5) 合法 commit（用结构化 message 参数）
+        with mock.patch("agent.tools.git_tool.subprocess.run", fake_run_staged):
+            rm = registry.execute("git", {"args": "commit", "message": "feat: add"}, ctx)
+            assert rm.ok, rm.render()
+
+        # 6) 空暂存区必须被拦截（提示先 git add）
+        with mock.patch("agent.tools.git_tool.subprocess.run", fake_run_empty):
+            re2 = registry.execute("git", {"args": "commit -m 'x'"}, ctx)
+            assert not re2.ok, "空暂存区 commit 必须被拦截"
+            assert "git add" in re2.render()
+
+
 def test_web_fetch_strips_html_and_rejects_bad_scheme():
     import io
     import urllib.request

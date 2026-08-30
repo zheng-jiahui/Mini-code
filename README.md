@@ -79,7 +79,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 │       ├── meta.py           # finish / ask_user / plan
 │       ├── todo.py           # todo：可追踪状态的任务清单
 │       ├── extra.py          # read_many_files / replace_in_file / web_fetch / think
-│       └── git_tool.py       # git：安全只读版本控制（白名单 + 拦截高危操作）
+│       └── git_tool.py       # git：受控版本控制（白名单只读 + add + 受控 commit）
 ├── docs/DESIGN.md            # 完整设计说明（主循环流程图、接口定义、错误策略等）
 └── tests/                    # 冒烟测试（Mock 后端，无需 API key）
 ```
@@ -90,7 +90,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 
 | 能力 | 说明 |
 |---|---|
-| 工具（共 23 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file` `move_file` `copy_file` `delete`；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch`；执行：`run_command`；版本控制：`git`（安全只读 + add）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签）`memory`（项目记忆） |
+| 工具（共 23 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file` `move_file` `copy_file` `delete`；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch`；执行：`run_command`；版本控制：`git`（受控提交 + 只读 + add）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签）`memory`（项目记忆） |
 | 双通道调用 | 优先原生 `tool_calls`；模型不支持时自动切到 ```json 文本协议 |
 | 上下文管理 | token 估算 → 工具回执智能压缩（信号行优先）→ 超阈值摘要压缩 → 硬截断兜底 |
 | 长程记忆 | **常驻事实层**：硬约束/技术选型/已失败方案常驻且不参与再压缩，避免"摘要的摘要"式衰减；压缩后重建工作区真实清单 |
@@ -105,7 +105,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 | 批量读取 | `read_many_files` 一次看清多个相关文件，省掉多轮往返 |
 | 全局替换 | `replace_in_file` 把所有同名旧符号统一换成新的（区别于 `edit_block` 的唯一匹配） |
 | 网页抓取 | `web_fetch` 用标准库自实现抓取 http/https 页面并剥离 HTML，让 agent 能自己读文档 / RFC / API 说明 |
-| 安全 git | `git` 白名单只读 + 暂存，机制上拦截 push / reset --hard / commit 等高危操作，避免误破坏仓库 |
+| 受控 git | `git` 白名单只读 + 暂存 + **受控提交**：commit 必须有提交信息、禁止改写历史选项（--amend / --no-verify / --allow-empty / --date / -a / --all）、禁止空暂存区提交；机制上拦截 push / reset --hard 等高危操作，避免误破坏仓库 |
 | 推理便签 | `think` 把推理 / 计划固定进上下文，长任务保持思路、便利用户审阅思考过程 |
 | 项目记忆 | `memory` 跨会话持久沉淀「项目约定 / 踩过的坑 / 已定选型」（落盘 `.minicode/memory.md`），启动时自动注入 system 提示词，下次会话免从零探索 |
 | 文件增删 | `move_file` / `copy_file` / `delete` 补足文件的移动 / 复制 / 删除；`delete` 删除前先备份到 `.agent_backups` 可恢复，删目录需 `recursive=true` |
