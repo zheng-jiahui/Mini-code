@@ -829,6 +829,25 @@ def test_grep_search_finds_pattern():
         assert "a.py:1:" in r.render() and "a.py:3:" in r.render()
 
 
+def test_grep_search_context_shows_surrounding_lines():
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "a.py").write_text(
+            "import os\n\ndef foo():\n    return 1\n\n\ndef bar():\n    return 2\n",
+            encoding="utf-8")
+        cfg = AgentConfig(workspace=tmp, session_log=None)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+        r = registry.execute("grep_search", {"pattern": "def foo", "context": 2}, ctx)
+        assert r.ok
+        # 命中行用 > 标出，且出现了上下各 2 行的 import / return
+        assert ">" in r.render()
+        assert "import os" in r.render(), "应显示上方 2 行上下文"
+        assert "return 1" in r.render(), "应显示下方 2 行上下文"
+        assert r.meta["files_with_match"] == 1
+
+
 def test_find_files_by_glob():
     with tempfile.TemporaryDirectory() as tmp:
         _cfg, _profile, registry, ctx = _make_env(tmp)

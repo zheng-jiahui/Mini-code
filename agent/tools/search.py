@@ -32,6 +32,7 @@ _MAX_FILE_BYTES = 2 * 1024 * 1024  # 跳过大于 2MB 的文件
     description=(
         "在工作区内按正则搜索文件内容，返回 文件:行号:内容。"
         "用于定位函数定义、报错来源、配置项等，比逐个 read_file 高效得多。"
+        "设置 context > 0 可在每条匹配上下各多显示几行代码，先看明白再动手。"
     ),
     parameters={
         "type": "object",
@@ -39,8 +40,9 @@ _MAX_FILE_BYTES = 2 * 1024 * 1024  # 跳过大于 2MB 的文件
             "pattern": {"type": "string", "description": "正则表达式，如 `def test_|class .*Test`"},
             "path": {"type": "string", "description": "搜索起点，相对工作区，默认 '.'", "default": "."},
             "include": {"type": "string", "description": "文件名过滤通配符，如 `*.py`，默认不限", "default": "*"},
-            "max_matches": {"type": "integer", "description": "最多返回多少条匹配，默认 50", "default": 50},
+            "max_matches": {"type": "integer", "description": "最多返回多少条匹配 / 多少个文件，默认 50", "default": 50},
             "case_sensitive": {"type": "boolean", "description": "是否区分大小写，默认 false", "default": False},
+            "context": {"type": "integer", "description": "匹配行前后各多显示几行上下文（默认 0，即只显示匹配行）", "default": 0},
         },
         "required": ["pattern"],
     },
@@ -48,6 +50,7 @@ _MAX_FILE_BYTES = 2 * 1024 * 1024  # 跳过大于 2MB 的文件
     when_not_to_use=(
         "已知确切文件名就直接 read_file；要按名字找文件用 find_files。"
         "别用 .* 这类宽泛模式——命中几百条只会淹没上下文，先用 include 收窄范围。"
+        "context 别开太大，几行足够看清上下文，开太大同样会淹没关键信息。"
     ),
 )
 def grep_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -63,12 +66,46 @@ def grep_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     root = ctx.resolve(args.get("path") or ".", must_exist=True)
     include = args.get("include") or "*"
     max_matches = max(1, int(args.get("max_matches") or 50))
+    context = max(0, int(args.get("context") or 0))
 
     files: List[Path] = [root] if root.is_file() else _iter_files(root, include)
-    hits: List[str] = []
     scanned = 0
+
+    # ---- 仅匹配行（context=0）：保持「文件:行号:内容」紧凑格式 ----
+    if context == 0:
+        hits: List[str] = []
+        for f in files:
+            if len(hits) >= max_matches:
+                break
+            try:
+                if f.stat().st_size > _MAX_FILE_BYTES:
+                    continue
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                continue
+            scanned += 1
+            rel = ctx.guard.relpath(f)
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if regex.search(line):
+                    hits.append(f"{rel}:{lineno}: {line.strip()[:300]}")
+                    if len(hits) >= max_matches:
+                        break
+        if not hits:
+            return ToolResult.success(
+                f"未找到匹配 /{pattern}/（扫描 {scanned} 个文件）",
+                meta={"matches": 0, "scanned": scanned},
+            )
+        tail = f"\n...（已达上限 {max_matches}，请缩小范围或改用更精确的模式）" if len(hits) >= max_matches else ""
+        return ToolResult.success(
+            f"匹配 /{pattern}/：{len(hits)} 处（扫描 {scanned} 个文件）\n" + "\n".join(hits) + tail,
+            meta={"matches": len(hits), "scanned": scanned},
+        )
+
+    # ---- 带上下文：每个文件输出一个带行号的小代码块，> 标出命中行 ----
+    blocks: List[str] = []
+    total_matches = 0
     for f in files:
-        if len(hits) >= max_matches:
+        if len(blocks) >= max_matches:
             break
         try:
             if f.stat().st_size > _MAX_FILE_BYTES:
@@ -77,21 +114,40 @@ def grep_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         except (OSError, ValueError):
             continue
         scanned += 1
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            if regex.search(line):
-                hits.append(f"{ctx.guard.relpath(f)}:{lineno}: {line.strip()[:300]}")
-                if len(hits) >= max_matches:
-                    break
+        lines = text.splitlines()
+        match_idx = [i for i, ln in enumerate(lines) if regex.search(ln)]
+        if not match_idx:
+            continue
+        idx_set = set(match_idx)
+        total_matches += len(match_idx)
+        # 合并相邻区间，避免重叠上下文重复显示
+        ranges: List[List[int]] = []
+        for i in match_idx:
+            lo = max(0, i - context)
+            hi = min(len(lines) - 1, i + context)
+            if ranges and lo <= ranges[-1][1] + 1:
+                ranges[-1][1] = hi
+            else:
+                ranges.append([lo, hi])
+        rel = ctx.guard.relpath(f)
+        buf = [f"── {rel} ──"]
+        for lo, hi in ranges:
+            for j in range(lo, hi + 1):
+                mark = ">" if j in idx_set else " "
+                buf.append(f"{j + 1:>5}{mark} {lines[j].rstrip()[:300]}")
+            buf.append("    …")
+        blocks.append("\n".join(buf))
 
-    if not hits:
+    if not blocks:
         return ToolResult.success(
             f"未找到匹配 /{pattern}/（扫描 {scanned} 个文件）",
             meta={"matches": 0, "scanned": scanned},
         )
-    tail = f"\n...（已达上限 {max_matches}，请缩小范围或改用更精确的模式）" if len(hits) >= max_matches else ""
+    tail = f"\n\n...（已达上限 {max_matches} 个文件，请缩小范围）" if len(blocks) >= max_matches else ""
     return ToolResult.success(
-        f"匹配 /{pattern}/：{len(hits)} 处（扫描 {scanned} 个文件）\n" + "\n".join(hits) + tail,
-        meta={"matches": len(hits), "scanned": scanned},
+        f"匹配 /{pattern}/：{len(blocks)} 个文件含命中（共 {total_matches} 处，扫描 {scanned} 个文件）\n"
+        + "\n\n".join(blocks) + tail,
+        meta={"files_with_match": len(blocks), "matches": total_matches, "scanned": scanned},
     )
 
 
