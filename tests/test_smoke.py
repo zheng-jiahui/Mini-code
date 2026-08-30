@@ -2318,6 +2318,58 @@ def test_empty_response_is_retried_with_hint_before_giving_up():
         assert "没有包含任何工具调用" in joined, "应把 _EMPTY_OUTPUT_HINT 回灌给模型"
 
 
+def test_read_many_files_reads_batch():
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        (base / "a.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        (base / "b.txt").write_text("hello\nworld\n", encoding="utf-8")
+        (base / "c.bin").write_bytes(b"\x00\x01\x02binary")
+        cfg = AgentConfig(workspace=tmp, session_log=None)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        r = registry.execute("read_many_files", {"paths": ["a.py", "b.txt", "c.bin", "missing.py"]}, ctx)
+        assert r.ok
+        assert "## a.py" in r.output and "## b.txt" in r.output
+        # 二进制与缺失都被优雅跳过，而不是报错
+        assert "疑似二进制" in r.output
+        assert "跳过" in r.output and "missing.py" in r.output
+        assert r.meta["read"] == 2, r.meta
+
+        # 空数组应报错（被转成 ok=False 回执，不崩溃）
+        re_ = registry.execute("read_many_files", {"paths": []}, ctx)
+        assert not re_.ok
+
+
+def test_replace_in_file_global_replaces_all():
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        (base / "m.py").write_text("x = OLD\ny = OLD\nz = NEW\n", encoding="utf-8")
+        cfg = AgentConfig(workspace=tmp, session_log=None, backup_on_write=False)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        r = registry.execute("replace_in_file",
+                             {"path": "m.py", "old_text": "OLD", "new_text": "NEW"}, ctx)
+        assert r.ok and r.meta["replacements"] == 2, r.meta
+        assert (base / "m.py").read_text(encoding="utf-8") == "x = NEW\ny = NEW\nz = NEW\n"
+
+        # 找不到应报错（ok=False，不崩溃）
+        rn = registry.execute("replace_in_file",
+                              {"path": "m.py", "old_text": "NOPE", "new_text": "X"}, ctx)
+        assert not rn.ok
+
+        # 空 old_text 必须被拒绝，否则会清空文件
+        re_ = registry.execute("replace_in_file",
+                               {"path": "m.py", "old_text": "", "new_text": "X"}, ctx)
+        assert not re_.ok
+        assert (base / "m.py").read_text(encoding="utf-8") == "x = NEW\ny = NEW\nz = NEW\n"
+
+
 def test_eval_task_suite_is_stdlib_only_and_deterministic():
     """任务套件的基本卫生：有验证器、有考察点、预置文件齐全。
 
@@ -2330,6 +2382,40 @@ def test_eval_task_suite_is_stdlib_only_and_deterministic():
         assert t.verify is not None, f"{t.name} 缺验证器"
         assert t.intent, f"{t.name} 缺考察点说明"
         assert t.prompt.strip(), f"{t.name} 缺任务描述"
+
+
+def test_todo_tool_manages_checklist():
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        r1 = registry.execute("todo", {"action": "add", "content": "读现状"}, ctx)
+        assert r1.ok and "第 1 条" in r1.output
+        r2 = registry.execute("todo", {"action": "add", "content": "写代码"}, ctx)
+        assert r2.ok and "第 2 条" in r2.output
+
+        rc = registry.execute("todo", {"action": "complete", "id": 1}, ctx)
+        assert rc.ok and "[x]" in rc.output
+
+        rr = registry.execute("todo", {"action": "remove", "id": 2}, ctx)
+        assert rr.ok
+
+        rl = registry.execute("todo", {"action": "list"}, ctx)
+        assert "1." in rl.output and "已完成 1 条" in rl.output
+
+        rb = registry.execute("todo", {"action": "complete", "id": 99}, ctx)
+        assert not rb.ok, "越界 id 应报错"
+
+        rm = registry.execute("todo", {"action": "add"}, ctx)
+        assert not rm.ok, "add 缺 content 应报错"
+
+        rcl = registry.execute("todo", {"action": "clear"}, ctx)
+        assert rcl.ok
+        rle = registry.execute("todo", {"action": "list"}, ctx)
+        assert "空" in rle.output
 
 
 # ----------------------------------------------------------------------------
