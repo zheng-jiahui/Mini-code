@@ -2839,6 +2839,46 @@ def test_lint_runs_py_syntax_check_and_parses_command_output():
             assert rr.ok and "BOOM" in rr.output and rr.meta.get("issues") == 0
 
 
+def test_summary_recaps_session_changes():
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None)
+        registry = build_default_registry()
+        session = {
+            "task": "实现登录功能",
+            "changes": [
+                {"kind": "write", "path": "auth.py", "captured": True,
+                 "before": None, "after": "def f():\n    return 1\n"},
+                {"kind": "edit", "path": "auth.py", "captured": True,
+                 "before": "def f():\n    return 1\n", "after": "def f():\n    return 2\n"},
+                {"kind": "replace_in_files", "path": "util.py", "captured": True,
+                 "before": "x = OLD\n", "after": "x = NEW\n"},
+            ],
+        }
+        ctx = build_tool_context(cfg, console=None, session=session)
+
+        assert "summary" in registry.names()
+
+        r = registry.execute("summary", {}, ctx)
+        assert r.ok, r.render()
+        assert "实现登录功能" in r.output
+        assert "auth.py" in r.output and "util.py" in r.output
+        assert "3 次动作" in r.output
+        # auth.py 最后一次改动后净变化：2→2 行，delta 0
+        assert "（2→2 行）" in r.output or "（新建）" in r.output
+        assert r.meta.get("changed_files") == 2
+
+        # verbose=false 只给汇总计数
+        r2 = registry.execute("summary", {"verbose": False}, ctx)
+        assert "auth.py" in r2.output
+
+        # 空会话：友好返回
+        ctx_empty = build_tool_context(cfg, console=None, session={})
+        r3 = registry.execute("summary", {}, ctx_empty)
+        assert r3.ok and "还没有任何改动记录" in r3.output
+
+
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0

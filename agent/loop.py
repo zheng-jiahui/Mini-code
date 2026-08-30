@@ -79,7 +79,7 @@ __all__ = ["RunResult", "AgentLoop"]
 
 # 只读工具：无副作用、互不依赖，可在同一轮里并行发出（V5 自主性）
 _READONLY_TOOLS = frozenset({"read_file", "list_dir", "grep_search", "find_files", "diff",
-                           "read_many_files", "web_fetch", "recall"})
+                           "read_many_files", "web_fetch", "recall", "summary"})
 
 _EMPTY_OUTPUT_HINT = (
     "你上一次的回复中没有包含任何工具调用，也没有明确的收尾标记。\n"
