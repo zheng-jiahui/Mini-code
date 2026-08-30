@@ -2752,6 +2752,47 @@ def test_recall_ranks_relevant_files():
         assert r2.ok and "未找到" in r2.output
 
 
+def test_replace_in_files_dry_run_then_apply_with_backup():
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        assert "replace_in_files" in registry.names()
+
+        (Path(tmp) / "a.py").write_text("def old_fn():\n    return OLD_NAME\n", encoding="utf-8")
+        (Path(tmp) / "b.py").write_text("x = OLD_NAME\ny = OLD_NAME\n", encoding="utf-8")
+        (Path(tmp) / "c.md").write_text("OLD_NAME 出现了一次\n", encoding="utf-8")
+
+        # 1) 默认 dry_run=true 只预览不落盘
+        rd = registry.execute("replace_in_files",
+                              {"old": "OLD_NAME", "new": "NEW_NAME", "include": "*.py"}, ctx)
+        assert rd.ok and "预览" in rd.output and "3 处" in rd.output, rd.render()
+        assert "OLD_NAME" in (Path(tmp) / "a.py").read_text(encoding="utf-8"), "dry_run 不应改写文件"
+
+        # 2) old 过短必须被拒绝
+        rs = registry.execute("replace_in_files", {"old": "e", "new": "x"}, ctx)
+        assert not rs.ok, "old 过短必须被拒绝"
+
+        # 3) 真正执行：两个 .py 文件共 3 处被改，且已备份
+        ra = registry.execute("replace_in_files",
+                              {"old": "OLD_NAME", "new": "NEW_NAME", "include": "*.py", "dry_run": False}, ctx)
+        assert ra.ok, ra.render()
+        assert "已改写 2 个文件" in ra.output and "3 处" in ra.output
+        assert "NEW_NAME" in (Path(tmp) / "a.py").read_text(encoding="utf-8")
+        assert (Path(tmp) / "a.py").read_text(encoding="utf-8").count("NEW_NAME") == 1
+        assert (Path(tmp) / "b.py").read_text(encoding="utf-8").count("NEW_NAME") == 2
+        # .md 不在 *.py 范围内，应未被改
+        assert "OLD_NAME" in (Path(tmp) / "c.md").read_text(encoding="utf-8")
+
+        # 4) 备份存在（.agent_backups/.overwrites 下）
+        backups = list(Path(tmp).parent.glob(".agent_backups/.overwrites/*/*/*.py"))
+        assert backups, "改写前应已备份"
+
+
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0
