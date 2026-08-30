@@ -2526,6 +2526,69 @@ def test_todo_tool_manages_checklist():
         assert "空" in rle.output
 
 
+def test_memory_tool_reads_appends_updates_clears():
+    from agent.tools import build_default_registry, build_tool_context
+    from agent.config import AgentConfig
+    from agent.tools.memory import MEMORY_DIR, MEMORY_FILE
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AgentConfig(workspace=tmp, session_log=None)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+
+        # read 空文件 → 友好提示
+        r0 = registry.execute("memory", {"action": "read"}, ctx)
+        assert r0.ok and "暂无项目记忆" in r0.output
+
+        # append 两条
+        a1 = registry.execute("memory", {"action": "append", "content": "测试用 pytest -q 跑"}, ctx)
+        assert a1.ok and "已追加" in a1.output
+        a2 = registry.execute("memory", {"action": "append", "content": "别用 print 调试"}, ctx)
+        assert a2.ok
+
+        # 落盘位置正确且内容包含两条
+        mem_path = Path(tmp) / MEMORY_DIR / MEMORY_FILE
+        assert mem_path.exists()
+        text = mem_path.read_text(encoding="utf-8")
+        assert "测试用 pytest -q 跑" in text and "别用 print 调试" in text
+
+        # read 返回内容
+        r1 = registry.execute("memory", {"action": "read"}, ctx)
+        assert "测试用 pytest -q 跑" in r1.output
+
+        # update 整体覆盖（content 不能为空）
+        u0 = registry.execute("memory", {"action": "update"}, ctx)
+        assert not u0.ok, "update 缺 content 应报错"
+        registry.execute("memory", {"action": "update",
+                                     "content": "# 项目约定\n- 一律用类型注解"}, ctx)
+        text2 = mem_path.read_text(encoding="utf-8")
+        assert "一律用类型注解" in text2 and "别用 print 调试" not in text2
+
+        # clear 删除文件
+        registry.execute("memory", {"action": "clear"}, ctx)
+        assert not mem_path.exists()
+        r2 = registry.execute("memory", {"action": "read"}, ctx)
+        assert "暂无项目记忆" in r2.output
+
+        # append 缺 content 应报错
+        ae = registry.execute("memory", {"action": "append"}, ctx)
+        assert not ae.ok
+
+
+def test_memory_notes_injected_into_system_prompt():
+    from agent.tools.memory import MEMORY_DIR, MEMORY_FILE, _SECTION_HEADER
+    with tempfile.TemporaryDirectory() as tmp:
+        # 预先写好项目记忆，AgentLoop 构造时应自动注入 system 提示词
+        mem_path = Path(tmp) / MEMORY_DIR / MEMORY_FILE
+        mem_path.parent.mkdir(parents=True, exist_ok=True)
+        mem_path.write_text("- 2026-08-30 约定：提交前必须跑测试\n", encoding="utf-8")
+
+        cfg, profile, registry, _ = _make_env(tmp)
+        # 复用 _make_env 的 registry/console；这里直接构造 loop 以检查 system_prompt
+        loop = AgentLoop(cfg, profile, _scripted([], native=True)[0], registry, console=None)
+        assert _SECTION_HEADER in loop.system_prompt, "记忆段落未注入 system 提示词"
+        assert "提交前必须跑测试" in loop.system_prompt
+
+
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0

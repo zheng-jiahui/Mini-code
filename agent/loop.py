@@ -73,6 +73,7 @@ from .profile import (WORKSPACE_STATE_MARKER, detect_project_profile, format_pro
 from .tools import build_tool_context
 from .tools.base import ToolContext, ToolRegistry, ToolResult
 from .tools.meta import FINISH_SENTINEL
+from .tools.memory import read_memory_file, format_memory_section
 
 __all__ = ["RunResult", "AgentLoop"]
 
@@ -173,6 +174,8 @@ class AgentLoop:
             native_tools=self.native,
             restrict_to_workspace=config.restrict_to_workspace,
             project_profile=self._project_profile,
+            memory_notes=format_memory_section(read_memory_file(
+                getattr(config, "workspace_root", None) or config.workspace)),
         )
         self.history = History(self.system_prompt)
         self.ctx: ToolContext = build_tool_context(config, console=console, session={})
@@ -319,6 +322,7 @@ class AgentLoop:
             native_tools=self.native,
             restrict_to_workspace=self.config.restrict_to_workspace,
             project_profile=self._project_profile,
+            memory_notes=format_memory_section(read_memory_file(self.workspace_root)),
         )
         self.history.system_prompt = self.system_prompt
         if self.history.messages and self.history.messages[0].get("role") == "system":

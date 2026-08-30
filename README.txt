@@ -23,10 +23,11 @@
 1. 零框架：未使用 LangChain / LlamaIndex / OpenAI Agents SDK / AutoGen / CrewAI 等任何 Agent 框架，
    仅用 OpenAI 兼容聊天补全客户端；对话历史、工具、解析、循环、压缩、错误全部自写。
 2. 双通道工具调用：优先原生 function calling；模型/网关不支持时自动切换 ```json 文本协议 + 自写解析校验纠错。
-3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环（共 19 个）：
+3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环（共 20 个）：
    read_file / write_file / edit_block / apply_patch / read_many_files / replace_in_file /
    list_dir / run_command / grep_search(支持上下文) / find_files / web_fetch / diff /
-   git(安全只读) / plan / finish / ask_user / rollback / todo(任务清单) / think(推理便签)。
+   git(安全只读) / plan / finish / ask_user / rollback / todo(任务清单) / think(推理便签) /
+   memory(项目记忆)。
 4. 上下文治理：tiktoken 精确 token 计数 + 工具回执智能压缩（信号行优先）+ 超阈值摘要压缩兜底；
    /stats 面板报真实 token、各工具耗时占比与时间去向（实测等模型约九成，瓶颈一目了然）。
 5. 循环控制：步数/连续失败上限、重复调用指纹去重、解析纠错回灌、Ctrl-C 保留历史。
@@ -42,6 +43,8 @@
    任一 hunk 对不上即整体失败不写盘），不依赖外部 patch/git 二进制；diff 工具与之配合可"先看改动再打补丁"。
 13. 更贴近商业 code agent：todo 任务清单防漏做、read_many_files 批量读、replace_in_file 全局替换、
    web_fetch 自读在线文档/RFC/API 说明、安全 git 只读版本控制、think 推理便签；一轮内多个只读调用并行发出。
+14. 跨会话项目记忆：memory 工具把「约定/踩坑/选型」落盘 .minicode/memory.md，启动时自动注入
+    system 提示词（类比 CLAUDE.md/AGENTS.md），下次会话免从零探索，且可 append 持续积累。
 
 三、其它
 - 架构图、System Prompt、工具规范、接口与错误分层见 docs/DESIGN.md。

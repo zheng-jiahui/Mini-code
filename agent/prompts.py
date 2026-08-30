@@ -49,6 +49,7 @@ _BASE = """\
 {tool_list}
 
 {project_profile}
+{memory_notes}
 # 工具调用协议
 {protocol}
 
@@ -149,6 +150,7 @@ def build_system_prompt(
     native_tools: bool = True,
     restrict_to_workspace: bool = True,
     project_profile: str = "",
+    memory_notes: str = "",
 ) -> str:
     """组装完整 System Prompt。
 
@@ -175,6 +177,7 @@ def build_system_prompt(
         path_rule=path_rule,
         tool_list=tool_list,
         project_profile=project_profile,
+        memory_notes=("\n" + memory_notes) if memory_notes else "",
         protocol=PROTOCOL_NATIVE if native_tools else PROTOCOL_TEXT,
     )
 
