@@ -833,3 +833,33 @@ LRU 的断言把 `put(4,4)` 后该淘汰的键写成了 1（实际是 3，因为
   **跑本项目自己的脚本时不要加**，直接调用受管 Python 即可。
 - 表格对齐：Python 的 `f'{s:<n}'` 按**字符数**补齐，中文报告要按
   **East Asian Width** 算显示宽度（W/F 记 2 列），否则整列错位。
+
+---
+
+## V14 —— 功能丰富化：对齐市面 code agent（2026-08-30 夜）
+
+**动因**：用户要求"项目更像市面上的 code agent、更接近 Claude Code / Codex，并完全符合考核 PDF"。
+对照标杆与现有工具，补齐三块最该有的能力（全部自写、本地执行、不依赖框架/服务端工具）。
+
+**新增工具（注册表 20 个 → 含 git 套件 / fetch_url / todo）**：
+1. `git_init` / `git_status` / `git_diff` / `git_log` / `git_commit`（`agent/tools/git.py`）
+   - 基于本地 `git` 子进程，`git -C <workspace>` 沙箱；
+   - 物理上只暴露只读 + 本地提交，无法 push / reset --hard / clean，符合 git 安全边界；
+   - 提交用环境变量固定 `GIT_AUTHOR/COMMITTER`，干净环境也能 commit（不依赖全局 user 配置）；
+   - 非仓库时给出"先 git_init"的可操作提示，绝不崩溃。
+2. `fetch_url`（`agent/tools/web.py`）：自写 urllib GET，仅 http/https，限 2MB/超时 20s，
+   HTML 轻量去标签抽文本；用于查文档/API 用法，不再凭记忆瞎写。
+3. `todo`（`agent/tools/meta.py`）：跨轮持久清单，pending/in_progress/completed 状态机，
+   比静态 `plan` 更贴近 Claude Code 的 TodoWrite。
+
+**配套改动**：
+- 系统提示词补充"版本控制自查 + fetch_url 查资料"的用法；
+- 模型档位切到 `hy3`（NSCC MaaS 端点不变），config.yaml / config.example.yaml 同步；
+- README 重写为 ≤1000 汉字合规版，含新功能与 hy3；DESIGN/VIDEO-SCRIPT 同步。
+
+**测试**：新增 5 个用例（git 真实仓库端到端、commit 拒空白说明、fetch_url 拒非 http、
+本地 http server 实测抽取、todo 状态机），全量 **107 个测试通过**。
+`test_every_tool_documents_when_not_to_use_it` 守护确保新工具都写了反向文档。
+
+**结论**：工具集从"文件+执行+检索+闭环"扩到含版本控制与联网查阅，更像一个完整的 coding agent；
+评测任务（MockBackend 脚本化）不受影响，真实运行能力边界显著拓宽。

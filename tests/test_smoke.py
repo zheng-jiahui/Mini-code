@@ -2147,6 +2147,34 @@ _BROKEN_SOLUTIONS = {
 }
 
 
+
+
+# indexer（hard 档）的参考解：基线模块取自 agent.eval 的 TASKS，避免两份拷贝漂移。
+# 正确解 = 基线 + 顺序/连续敏感的 phrase_search；错误解 = 基线 + 仅 AND 的"伪短语"（顺序不敏感）。
+from agent.eval import TASKS as _EVAL_TASKS
+_IDX_BASE = next(t.files["index.py"] for t in _EVAL_TASKS if t.name == "indexer")
+_IDX_PHRASE_OK = (
+    "\n    def phrase_search(self, phrase):\n"
+    "        '返回出现确切词序列（顺序一致、连续）的文档 id 集合。'\n"
+    "        toks = tokenize(phrase)\n"
+    "        if not toks:\n"
+    "            return set()\n"
+    "        out = set()\n"
+    "        for doc_id, seq in self._docs.items():\n"
+    "            for i in range(len(seq) - len(toks) + 1):\n"
+    "                if seq[i:i + len(toks)] == toks:\n"
+    "                    out.add(doc_id)\n"
+    "                    break\n"
+    "        return out\n"
+)
+_IDX_PHRASE_BAD = (
+    "\n    def phrase_search(self, phrase):\n"
+    "        '错：只要求词都出现，忽略顺序与连续性（典型偷懒写法）。'\n"
+    "        return self.search_all(*tokenize(phrase))\n"
+)
+_CORRECT_SOLUTIONS["indexer"] = {"index.py": _IDX_BASE + _IDX_PHRASE_OK}
+_BROKEN_SOLUTIONS["indexer"] = {"index.py": _IDX_BASE + _IDX_PHRASE_BAD}
+
 def _verify_with(task_name, solutions):
     """把参考解放进临时目录，跑该任务的验证器。"""
     from agent.eval import TASKS
@@ -2353,6 +2381,133 @@ def test_eval_task_suite_is_stdlib_only_and_deterministic():
         assert t.verify is not None, f"{t.name} 缺验证器"
         assert t.intent, f"{t.name} 缺考察点说明"
         assert t.prompt.strip(), f"{t.name} 缺任务描述"
+def test_eval_repeat_report_aggregates_pass_rates_and_medians():
+    """--repeat 报告应给出每任务通过率、步数/调用中位数与整体通过率分布。"""
+    from agent.eval import EvalOutcome, render_repeat_report
+    mk = lambda task, intent, ok, steps, calls: EvalOutcome(
+        task, intent, "finish", steps, calls, 0, 1.0, 100, ok,
+        "通过" if ok else "失败")
+    # 3 次运行、2 个任务：A 三次都过；B 仅第 2 次过
+    runs = [
+        [mk("A", "新建", True, 3, 3), mk("B", "修 bug", False, 5, 6)],
+        [mk("A", "新建", True, 4, 4), mk("B", "修 bug", True, 6, 7)],
+        [mk("A", "新建", True, 3, 3), mk("B", "修 bug", False, 5, 6)],
+    ]
+    report = render_repeat_report(runs, model="m", elapsed=10.0)
+    assert "重复 3 次" in report
+    # A 通过率 100%，B 通过率 33%（1/3 显示 33%）
+    assert "100%" in report and "33%" in report
+    # 整体通过率分布：三次为 50%/100%/50% -> min 50% median 50% max 100%
+    assert "min 50%" in report and "median 50%" in report and "max 100%" in report
+    assert "整体通过率分布" in report
+    assert "50%, 100%, 50%" in report, "应列出每次运行的通过率"
+    # 默认难度档在报告里出现
+    assert "standard" in report
+
+
+
+# ----------------------------------------------------------------------------
+# 追加工作：V14 新工具（git / fetch_url / todo）功能测试
+# ----------------------------------------------------------------------------
+def _make_git_env(tmpdir):
+    cfg = AgentConfig(workspace=tmpdir, session_log=None, per_task_dir=False)
+    registry = build_default_registry()
+    ctx = build_tool_context(cfg, console=None, session={})
+    return cfg, registry, ctx
+
+
+def test_git_tools_in_a_real_repo():
+    """端到端验证 git 工具集：非仓库提示 -> init -> status -> commit -> log -> diff 为空。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, registry, ctx = _make_git_env(tmp)
+        # 不是仓库时给出可操作提示（不崩溃）
+        r0 = registry.execute("git_status", {}, ctx)
+        assert not r0.ok and "git_init" in (r0.meta.get("hint") or ""), r0.output
+        # init
+        r = registry.execute("git_init", {}, ctx)
+        assert r.ok and r.meta.get("is_repo") is True, r.output
+        # 写一个文件
+        (Path(tmp) / "a.py").write_text("print('hi')\n", encoding="utf-8")
+        rs = registry.execute("git_status", {}, ctx)
+        assert rs.ok and "a.py" in rs.output, rs.output
+        # commit
+        rc = registry.execute("git_commit", {"message": "init a.py"}, ctx)
+        assert rc.ok and rc.meta.get("committed") == 1, rc.output
+        # log 有一条
+        rl = registry.execute("git_log", {"max_count": 5}, ctx)
+        assert rl.ok and "init a.py" in rl.output, rl.output
+        # 提交后 diff 为空
+        rd = registry.execute("git_diff", {}, ctx)
+        assert rd.ok and rd.meta.get("diff_lines") == 0, rd.output
+
+
+def test_git_commit_rejects_empty_message():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, registry, ctx = _make_git_env(tmp)
+        registry.execute("git_init", {}, ctx)
+        rc = registry.execute("git_commit", {"message": "   "}, ctx)
+        assert not rc.ok, "空白提交说明必须被拒绝"
+
+
+def test_fetch_url_rejects_non_http_scheme():
+    cfg = AgentConfig(workspace=".", session_log=None)
+    registry = build_default_registry()
+    ctx = build_tool_context(cfg, console=None, session={})
+    r = registry.execute("fetch_url", {"url": "file:///etc/passwd"}, ctx)
+    assert not r.ok, "file:// 必须被拒绝"
+    r2 = registry.execute("fetch_url", {"url": "ftp://example.com/x"}, ctx)
+    assert not r2.ok, "ftp:// 必须被拒绝"
+
+
+def test_fetch_url_fetches_local_server_and_strips_html():
+    """起一个本地 http server，验证 fetch_url 能取到内容并抽取文本。"""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html><head><title>t</title></head><body><p>hello agent</p></body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        cfg = AgentConfig(workspace=".", session_log=None)
+        registry = build_default_registry()
+        ctx = build_tool_context(cfg, console=None, session={})
+        r = registry.execute("fetch_url", {"url": f"http://127.0.0.1:{port}/"}, ctx)
+        assert r.ok, r.output
+        assert "hello agent" in r.output, r.output
+        assert "<html>" not in r.output, "HTML 标签应被去掉"
+    finally:
+        srv.shutdown()
+
+
+def test_todo_tool_state_machine():
+    """todo：add -> update(in_progress) -> 非法编号/状态报错 -> complete -> clear。"""
+    cfg = AgentConfig(workspace=".", session_log=None)
+    registry = build_default_registry()
+    ctx = build_tool_context(cfg, console=None, session={})
+    r = registry.execute("todo", {"action": "add", "items": ["读现状", "改 X"]}, ctx)
+    assert r.ok and ctx.session["todos"][0]["status"] == "pending"
+    r2 = registry.execute("todo", {"action": "update", "id": 1, "status": "in_progress"}, ctx)
+    assert r2.ok and ctx.session["todos"][0]["status"] == "in_progress"
+    r3 = registry.execute("todo", {"action": "update", "id": 99, "status": "completed"}, ctx)
+    assert not r3.ok, "不存在的编号应报错"
+    r4 = registry.execute("todo", {"action": "update", "id": 1, "status": "bad"}, ctx)
+    assert not r4.ok, "非法状态应报错"
+    r5 = registry.execute("todo", {"action": "update", "id": 2, "status": "completed"}, ctx)
+    assert r5.ok and ctx.session["todos"][1]["status"] == "completed"
+    r6 = registry.execute("todo", {"action": "clear"}, ctx)
+    assert r6.ok and len(ctx.session["todos"]) == 0
 
 
 # ----------------------------------------------------------------------------

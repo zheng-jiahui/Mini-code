@@ -31,7 +31,7 @@ agent/loop.py          主循环（编排者）：调模型→解析→执行工
    ├── agent/llm.py      LLM 接入层（OpenAI SDK / 原生 HTTP / Mock 三种后端）
    ├── agent/history.py  对话历史（OpenAI 格式）+ token 计数 + 自动压缩
    ├── agent/parser.py   模型输出解析（原生 tool_calls / 文本协议 ```json）
-   ├── agent/tools/      工具系统：base（注册表/回执）+ filesystem/search/shell/meta/repair/review
+   ├── agent/tools/      工具系统：base（注册表/回执）+ filesystem/search/shell/meta/repair/review/patch/git/web
    ├── agent/profile.py    项目画像（识别语言/框架/构建与测试命令，注入 system prompt）
    ├── agent/selfrepair.py  自修复「感知」层（纯函数，可单测）
    ├── agent/security.py 安全层：路径沙箱 / 危险命令 / 输出净化 / 智能压缩

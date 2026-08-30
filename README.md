@@ -1,106 +1,29 @@
-# MiniCode —— 从零实现的编程智能体（Coding Agent）
+# MiniCode —— 从零实现的编程智能体
 
-不依赖 **任何 Agent 框架 / SDK**（LangChain、LlamaIndex、OpenAI Agents SDK、Claude Agent SDK、AutoGen、CrewAI 一律未使用）。
-仅使用 OpenAI 兼容的 **聊天补全 API 客户端**；对话历史管理、工具定义与本地执行、模型输出解析、循环终止、错误处理、上下文压缩，全部自行实现。
+不依赖任何 Agent 框架 / SDK（LangChain、LlamaIndex、OpenAI Agents SDK、Claude Agent SDK、AutoGen、CrewAI 均未使用）。仅用 OpenAI 兼容的聊天补全 API；对话历史、工具定义与本地执行、输出解析、循环终止、错误处理、上下文压缩全部自写。类似一个简化的 Claude Code / Codex。
 
----
-
-## 1. 快速开始
+## 快速开始
 
 ```bash
-# 1) 安装依赖
 pip install -r requirements.txt
-
-# 2) 配置 API：复制模板，填入自己的凭据（config.yaml 已在 .gitignore 中，不会入库）
-cp config.example.yaml config.yaml
-#   推荐做法：把密钥留在环境变量里，config.yaml 只写占位符 ${OPENAI_API_KEY}
-export OPENAI_API_KEY="sk-xxxxxx"
-
-# 3) 运行
-python run.py                                  # 交互式 REPL
-python run.py -t "写一个快排并跑通测试"          # 单次任务
-python run.py --workspace ./demo -t "..."      # 指定工作目录（沙箱根）
-python run.py --mock -t "演示一次工具调用"        # 离线演示：不发请求，用脚本化模型
-python run.py --resume -t "接着上次继续"         # 从上次检查点恢复后继续
-python run.py --list-tools                     # 查看全部工具
+cp config.example.yaml config.yaml      # 填入凭据（config.yaml 已在 .gitignore，不入库）
+export NSCC_API_KEY="sk-xxxx"            # hy3 端点密钥
+python run.py -t "写一个快排并跑通测试"   # 单次任务
+python run.py --mock -t "演示工具调用"    # 离线演示（不发请求）
+python -m agent.eval                     # 能力评测（11 个任务，以产物验证为准）
 ```
 
-**跑一次能力评测**（真实端点，约 40 秒）：
+切换模型：`python run.py --list-profiles` / `--profile deepseek`；`AGENT_MODEL` 等环境变量可临时覆盖。
 
-```bash
-python -m agent.eval                           # 5 个标准任务，以产物验证为准
-python -m agent.eval --task calc,dedup --json  # 只跑指定任务 / 落盘 JSON
-```
+## 已实现能力
 
-**切换模型档位**（档位在 `config.yaml` 的 `profiles` 下配置，可同时配多个端点）：
+- 文件：`read_file`（带行号）`write_file`（覆盖前备份）`edit_block`（精确替换）`list_dir`
+- 执行：`run_command`（超时夹取、交互挂死检测、GBK 不乱码）
+- 检索：`grep_search` `find_files` `fetch_url`（联网查文档，自写 urllib，仅 http/https）
+- 版本控制：`git_init` `git_status` `git_diff` `git_log` `git_commit`（仅本地提交，绝不 push / 改写历史）
+- 规划与闭环：`plan` `todo`（带 pending/in_progress/completed 进度）`finish` `ask_user` `rollback`（回退快照）`diff` `apply_patch` 自修复
+- 工程化：原生 `tool_calls` 与文本协议双通道；token 预算与自动压缩；检查点续跑；危险命令拦截/二次确认；质量指标（结局/工具失败率/自修复回合）
 
-```bash
-python run.py --list-profiles                  # 列出全部档位（* 为当前生效）
-python run.py --profile deepseek -t "..."      # 用指定档位跑一次
-AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆盖，优先级高于配置文件
-```
+## 设计要点
 
-> `AGENT_*` 系列环境变量优先级最高：`AGENT_API_KEY` / `AGENT_BASE_URL` / `AGENT_MODEL` /
-> `AGENT_TEMPERATURE` / `AGENT_PROFILE` / `AGENT_WORKSPACE` / `AGENT_CONFIG`。
-
----
-
-## 2. 文件结构
-
-```
-.
-├── run.py                    # 命令行入口（REPL / 单次任务 / 工具自检）
-├── config.example.yaml       # 配置模板（入库）
-├── config.yaml               # 你的真实配置（不入库）
-├── agent/
-│   ├── config.py             # 配置加载：YAML/JSON + 环境变量覆盖 + 校验
-│   ├── errors.py             # 错误类型分层
-│   ├── llm.py                # LLM 后端：openai SDK / 原生 requests / 离线 Mock + 重试
-│   ├── parser.py             # 模型输出解析（原生 tool_calls + 文本协议 fallback）
-│   ├── history.py            # 对话历史、token 估算、工具输出截断、自动压缩
-│   ├── prompts.py            # System Prompt 与各类提示词模板
-│   ├── security.py           # 路径沙箱、危险命令识别、输出脱敏/截断
-│   ├── ui.py                 # 终端渲染（事件流、彩色、确认交互）
-│   ├── loop.py               # ★ 主循环：解析 → 执行 → 回灌 → 终止判定
-│   ├── cli.py                # 参数解析与 REPL 命令
-│   ├── profile.py            # 项目画像（语言/框架/测试命令）+ 工作区状态扫描
-│   ├── selfrepair.py         # 自修复感知层：测试命令识别、traceback 定位（纯函数）
-│   ├── metrics.py            # 质量指标：结局分布 / 自修复回合 / 返工
-│   ├── checkpoint.py         # 会话检查点：跨进程续跑
-│   ├── eval.py               # 评测台：5 个标准任务，验证产物
-│   └── tools/
-│       ├── base.py           # ToolSpec / ToolRegistry / ToolResult（自建工具系统）
-│       ├── filesystem.py     # read_file / write_file / edit_block / list_dir
-│       ├── shell.py          # run_command
-│       ├── search.py         # grep_search / find_files
-│       ├── patch.py          # apply_patch（自实现 unified diff 应用器，不依赖外部 patch/git）
-│       ├── repair.py         # rollback（整目录 / 单文件级回退到历史快照）
-│       ├── review.py         # build_diff：本次会话改动的 unified diff
-│       └── meta.py           # finish / ask_user / plan
-├── docs/DESIGN.md            # 完整设计说明（主循环流程图、接口定义、错误策略等）
-└── tests/                    # 冒烟测试（Mock 后端，无需 API key）
-```
-
----
-
-## 3. 已实现能力
-
-| 能力 | 说明 |
-|---|---|
-| 工具 | `read_file` `write_file` `list_dir` `run_command` `grep_search` `find_files` `finish` `ask_user` |
-| 双通道调用 | 优先原生 `tool_calls`；模型不支持时自动切到 ```json 文本协议 |
-| 上下文管理 | token 估算 → 工具回执智能压缩（信号行优先）→ 超阈值摘要压缩 → 硬截断兜底 |
-| 长程记忆 | **常驻事实层**：硬约束/技术选型/已失败方案常驻且不参与再压缩，避免"摘要的摘要"式衰减；压缩后重建工作区真实清单 |
-| 会话续跑 | 每个任务（含中断/报错）自动保存检查点，`--resume` 可跨进程接着上次继续；只存"发生过什么"，system 提示词等"当前状态"恢复时重建 |
-| 自修复 | 运行失败自动定位 traceback 并附上出错位置源码、测试命令自动识别、修复预算、一键回滚 |
-| 循环控制 | 步数上限、token 预算、连续错误上限、重复调用指纹去重、假完成拦截、用户 Ctrl-C 中断 |
-| 安全 | 工作区路径沙箱、危险命令拦截/二次确认、命令超时（带上限夹取）、写前自动备份 |
-| 可观测 | 每步打印「思考 / 工具调用 / 结果 / 耗时」，流式输出，`/diff` 审阅改动、`/stats` 成本与瓶颈面板，会话可存 JSONL 复盘 |
-| 质量指标 | `/stats` 也回答"做对了没有"：结局分布、失败率、自修复回合数、返工 |
-| 评测台 | `python -m agent.eval`：5 个标准任务，**以产物能否跑通为准**（不采信模型自述），并标出假完成 / 悲观失败 |
-
----
-
-## 4. 设计文档
-
-完整的 7 项设计（文件结构、主循环伪代码与流程图、System Prompt、工具调用输出格式规范、模块接口定义、错误处理策略、配置管理）见 [`docs/DESIGN.md`](docs/DESIGN.md)。
+评测以「产物能否跑通」为准，标出假完成 / 悲观失败；`/stats` 给出真实成本与瓶颈。主循环、工具系统、上下文压缩、错误处理等全部自行实现，详见 `docs/DESIGN.md`。
