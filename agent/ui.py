@@ -75,11 +75,53 @@ class Console:
         return f"{time.time() - self._start:.1f}s"
 
     # ---------------- 展示 ----------------
-    def banner(self, summary: str, version: str = "") -> None:
+    def banner(self, summary: str, version: str = "", tagline: str = "", meta: str = "") -> None:
         self.rule()
         self.echo(self._c(f"  MiniCode {version}".strip(), _Style.BOLD + _Style.CYAN))
-        self.echo(self._c(f"  {summary}", _Style.GREY))
+        if tagline:
+            self.echo(self._c(f"  {tagline}", _Style.GREY))
+        if summary:
+            self.echo(self._c(f"  {summary}", _Style.GREY))
+        if meta:
+            self.echo(self._c(f"  {meta}", _Style.DIM))
         self.echo(self._c("  输入 /help 查看命令，Ctrl-C 中断当前任务", _Style.GREY))
+        self.rule()
+
+    def report_card(self, result: Any, *, memory_added: int = 0, memory_total: int = 0) -> None:
+        """任务收尾报告卡：把一次运行的真实指标收进一个框，方便答辩演示一眼看清。
+
+        展示「成功徽章 + 结束原因 + 步数/工具调用/自修复/失败/Token/耗时 + 记忆状态」。
+        自修复次数与记忆状态来自主循环回传的真实信号（result.repair_rounds / memory_*）。
+        """
+        ok = getattr(result, "finish_reason", "") in ("finish", "model_final")
+        badge = (self._c("✅ 任务完成", _Style.BOLD + _Style.GREEN)
+                 if ok else
+                 self._c("⚠ 任务未成功", _Style.BOLD + _Style.YELLOW))
+        self.rule("任务报告")
+        self.echo(f"  {badge}  ·  结束原因：{getattr(result, 'finish_reason', 'unknown')}")
+        usage = getattr(result, "usage", None) or {}
+        token = usage.get("total_tokens", 0)
+        rows = [
+            ("步数", getattr(result, "steps", 0)),
+            ("工具调用", getattr(result, "tool_calls", 0)),
+            ("自修复", int(getattr(result, "repair_rounds", 0) or 0)),
+            ("失败", getattr(result, "errors", 0)),
+            ("Token 消耗", f"{token:,}"),
+            ("耗时", f"{getattr(result, 'elapsed', 0.0):.1f}s"),
+        ]
+        for k, v in rows:
+            self.echo(self._c(f"  {k}", _Style.DIM) + self._c(f"：{v}", _Style.BOLD))
+        if memory_added > 0:
+            self.echo(self._c(
+                f"  ✦ 记忆自更新：沉淀 {memory_added} 条经验 → .minicode/memory.md"
+                f"（现共 {memory_total} 条，下次启动注入）",
+                _Style.CYAN,
+            ))
+        elif memory_total > 0:
+            self.echo(self._c(
+                f"  ✦ 记忆库当前 {memory_total} 条经验（本次无失败信号，未沉淀新经验）",
+                _Style.GREY,
+            ))
         self.rule()
 
     def step(self, n: int, max_steps: int, note: str = "") -> None:

@@ -3146,6 +3146,52 @@ def test_self_improve_tool_digest_and_list_and_forget():
         assert "暂无" in r4.output, "forget 后应为空"
 
 
+def test_report_card_renders_metrics_and_memory():
+    """收尾报告卡把真实指标与记忆状态收进一个框，且不含 ANSI 噪声（color=False）。"""
+    import io
+    import contextlib
+    from agent.ui import Console
+    from agent.loop import RunResult
+
+    r = RunResult()
+    r.finish_reason = "finish"
+    r.steps = 5
+    r.tool_calls = 4
+    r.repair_rounds = 1
+    r.errors = 0
+    r.usage = {"total_tokens": 1234}
+    r.elapsed = 2.5
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        Console(verbose=True, color=False).report_card(r, memory_added=1, memory_total=7)
+    out = buf.getvalue()
+    assert "任务完成" in out, out
+    assert "自修复" in out and "1" in out, out
+    assert "Token 消耗" in out and "1,234" in out, out
+    assert "记忆自更新" in out and "7" in out, out
+
+
+def test_banner_shows_compliance_badge_and_memory_count():
+    """启动横幅亮出合规徽章、工具数、模型/权限与已加载经验条数。"""
+    import io
+    import contextlib
+    from agent.ui import Console
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        Console(verbose=True, color=False).banner(
+            "profile=x model=Qwen3.5",
+            version="v0.1.0",
+            tagline="不依赖任何 Agent 框架 · 纯标准库从零实现 · 31 个工具",
+            meta="model=Qwen3.5 · 权限模式=auto · 记忆自更新：已加载 3 条经验",
+        )
+    out = buf.getvalue()
+    assert "MiniCode v0.1.0" in out, out
+    assert "不依赖任何 Agent 框架" in out, out
+    assert "31 个工具" in out, out
+    assert "已加载 3 条经验" in out, out
+
+
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0

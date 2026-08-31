@@ -21,6 +21,7 @@ from .config import load_config
 from .errors import AgentError, ConfigError
 from .llm import build_backend
 from .loop import AgentLoop
+from .self_improve import read_lessons
 from .tools import build_default_registry
 from .ui import Console
 
@@ -48,9 +49,24 @@ BANNER_HELP = """\
 """
 
 DEMO_SCRIPT: List[Dict[str, Any]] = [
-    {"content": "我先看一下工作区里有什么。", "tool_calls": [{"name": "list_dir", "arguments": {"path": ".", "depth": 1}}]},
     {
-        "content": "写一个文件并跑一下，验证环境可用。",
+        "content": "收到。这个任务不大，但我先列个计划，免得跑偏。",
+        "tool_calls": [
+            {
+                "name": "plan",
+                "arguments": {
+                    "steps": [
+                        "看一眼工作区现状",
+                        "写 hello_agent.py（含 greet 函数与 __main__ 入口）",
+                        "运行脚本验证输出",
+                    ]
+                },
+            }
+        ],
+    },
+    {"content": "先看一下工作区里有什么。", "tool_calls": [{"name": "list_dir", "arguments": {"path": ".", "depth": 1}}]},
+    {
+        "content": "按计划写文件。",
         "tool_calls": [
             {
                 "name": "write_file",
@@ -166,7 +182,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     loop = AgentLoop(cfg.agent, cfg.llm, backend, registry, console=console)
 
-    console.banner(cfg.describe(), version=f"v{__version__}")
+    # 启动横幅：合规徽章 + 运行时信息（模型/权限/已加载经验），让"用心"第一眼可见
+    n_tools = len(registry)
+    try:
+        mem_count = len(read_lessons(cfg.agent.resolved_workspace()))
+    except OSError:
+        mem_count = 0
+    tagline = f"不依赖任何 Agent 框架 · 纯标准库从零实现 · {n_tools} 个工具"
+    meta = (f"model={cfg.llm.model} · 权限模式={getattr(cfg.agent, 'permission_mode', 'auto')} · "
+            f"记忆自更新：已加载 {mem_count} 条经验")
+    console.banner(cfg.describe(), version=f"v{__version__}", tagline=tagline, meta=meta)
     if cfg.source:
         console.echo(console._c(f"  配置来源：{cfg.source}", "\033[90m"))
     if backend_kind == "mock":
@@ -193,9 +218,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             console.info(f"已归档备份：{result.backup_dir}")
         if result.checkpoint:
             console.info(f"会话检查点：{result.checkpoint}（下次 --resume 可续跑）")
-        console.stats({"步数": result.steps, "工具调用": result.tool_calls,
-                       "失败": result.errors, "耗时": f"{result.elapsed:.1f}s",
-                       "结束原因": result.finish_reason})
+        console.report_card(
+            result,
+            memory_added=getattr(result, "memory_added", 0),
+            memory_total=getattr(result, "memory_total", 0),
+        )
         return 0 if result.succeeded else 1
 
     # ---- REPL ----
@@ -354,7 +381,11 @@ def _repl(loop: AgentLoop, console: Console) -> int:
         if result.backup_dir:
             console.info(f"已归档备份：{result.backup_dir}")
         console.final(result.answer)
-        console.echo(console._c("  " + result.stats_line(), "\033[90m") if console.color else "  " + result.stats_line())
+        console.report_card(
+            result,
+            memory_added=getattr(result, "memory_added", 0),
+            memory_total=getattr(result, "memory_total", 0),
+        )
 
 
 def _undo(console: Optional[Console], config, task_name: Optional[str] = None) -> str:

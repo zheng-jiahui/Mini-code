@@ -74,7 +74,7 @@ from .tools import build_tool_context
 from .tools.base import ToolContext, ToolRegistry, ToolResult
 from .tools.meta import FINISH_SENTINEL
 from .tools.memory import read_memory_file, format_memory_section
-from .self_improve import SessionSignal, derive_lessons, record_lessons as _record_lessons
+from .self_improve import SessionSignal, derive_lessons, record_lessons as _record_lessons, read_lessons
 
 __all__ = ["RunResult", "AgentLoop"]
 
@@ -122,11 +122,14 @@ class RunResult:
     steps: int = 0
     tool_calls: int = 0
     errors: int = 0
+    repair_rounds: int = 0          # 自修复成功回合数（来自 metrics，用于收尾报告卡）
     changes: List[Dict[str, Any]] = field(default_factory=list)
     usage: Dict[str, int] = field(default_factory=dict)
     elapsed: float = 0.0
     compacted: int = 0
     error_message: str = ""
+    memory_added: int = 0           # 本次自我改进新增的经验条数（收尾报告卡展示）
+    memory_total: int = 0           # 当前项目记忆里的经验总条数
     task_dir: str = ""            # 任务目录：workplace/{任务名}/，始终是最新的
     backup_dir: str = ""          # 本次快照：.agent_backups/{任务名}_{时间戳}_{第N次}/
     checkpoint: str = ""          # 会话检查点：可用于下次 --resume 续跑
@@ -426,14 +429,10 @@ class AgentLoop:
 
             # V31 自我改进：任务结束（含中断/报错）后，把本次信号沉淀成经验到项目记忆，
             # 下次启动自动注入 system 提示词。失败绝不拖垮任务结果。
+            # 输出统一交给 cli 的 report_card，避免重复打印。
             if self.config.auto_improve:
                 try:
-                    added = self._run_self_improve(result)
-                    if added and self.console:
-                        self.console.info(
-                            f"[self-improve] 沉淀 {added} 条经验到项目记忆"
-                            f"（.minicode/memory.md，下次启动注入）"
-                        )
+                    self._run_self_improve(result)
                 except Exception:  # noqa: BLE001 —— 自我改进失败不影响主流程
                     pass
 
@@ -443,7 +442,11 @@ class AgentLoop:
     # V31 自我改进
     # ------------------------------------------------------------------
     def _run_self_improve(self, result: "RunResult") -> int:
-        """把本次任务的可观测信号映射成经验，落盘到项目记忆。返回新增条数。"""
+        """把本次任务的可观测信号映射成经验，落盘到项目记忆。返回新增条数。
+
+        同时把「自修复次数 / 新增经验数 / 经验总数」写回 result，
+        供 cli 的 report_card 展示——让「会学习的 agent」在收尾时一眼可见。
+        """
         agg = self.metrics.aggregate()
         signal = SessionSignal(
             repair_rounds=int(agg.get("repair_rounds") or 0),
@@ -455,6 +458,7 @@ class AgentLoop:
             aborted=result.finish_reason == "aborted",
             llm_error=result.finish_reason == "llm_error",
         )
+        result.repair_rounds = signal.repair_rounds
         # 暂存完整信号，供 self_improve 工具中途 digest 时复用
         self.ctx.session["_last_signal"] = {
             "repair_rounds": signal.repair_rounds,
@@ -468,8 +472,12 @@ class AgentLoop:
         }
         lessons = derive_lessons(signal)
         if not lessons:
+            result.memory_total = len(read_lessons(self.workspace_root))
             return 0
-        return _record_lessons(self.workspace_root, lessons)
+        added = _record_lessons(self.workspace_root, lessons)
+        result.memory_added = added
+        result.memory_total = len(read_lessons(self.workspace_root))
+        return added
 
     # ------------------------------------------------------------------
     # 循环主体
