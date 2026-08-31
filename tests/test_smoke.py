@@ -31,7 +31,7 @@ from agent.checkpoint import checkpoint_dir, load as load_checkpoint  # noqa: E4
 from agent.config import AgentConfig, LLMProfile, load_config  # noqa: E402
 from agent.history import MAX_FACTS_CHARS, History  # noqa: E402
 from agent.llm import AssistantMessage, MockBackend  # noqa: E402
-from agent.loop import AgentLoop  # noqa: E402
+from agent.loop import AgentLoop, RunResult  # noqa: E402
 from agent.parser import ToolCallParser, extract_text_calls  # noqa: E402
 from agent.tools import build_default_registry, build_tool_context  # noqa: E402
 from agent.tools.base import DIFF_CAPTURE_CAP, ToolResult  # noqa: E402
@@ -3056,6 +3056,94 @@ def test_delegate_child_cannot_recurse_and_cannot_ask_user():
         # 子任务里那次"未知工具 delegate"应被记成一次错误回执，而非真的又开了个子智能体
         # （若递归发生，脚本会在第 2 个 delegate 处需要更多消息并走向 FINAL，finish_reason 仍为 finish，
         #  此处主要验证：整套运行正常结束、未抛异常）
+
+
+# ----------------------------------------------------------------------------
+# V31 自我改进钩子
+# ----------------------------------------------------------------------------
+def test_self_improve_derive_lessons_maps_signals():
+    from agent.self_improve import SessionSignal, derive_lessons
+
+    sig = SessionSignal(repair_rounds=1, tool_errors=2, permission_denied=1, compactions=1)
+    lessons = derive_lessons(sig)
+    assert any("自修复" in l for l in lessons), "repair 信号应映射出修复经验"
+    assert any("权限" in l for l in lessons), "permission 信号应映射出权限经验"
+    assert any("压缩" in l for l in lessons), "compaction 信号应映射出压缩经验"
+
+    # 空信号 → 无经验
+    assert derive_lessons(SessionSignal()) == []
+
+
+def test_self_improve_record_lessons_dedups_and_forget():
+    from agent.self_improve import (SessionSignal, derive_lessons, record_lessons,
+                                    forget_lessons, read_lessons)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sig = SessionSignal(tool_errors=1, compactions=1)
+        lessons = derive_lessons(sig)
+        n1 = record_lessons(tmp, lessons)
+        assert n1 == len(lessons), "首次应全部写入"
+
+        # 重复写入 → 去重，新增 0
+        n2 = record_lessons(tmp, lessons)
+        assert n2 == 0, "重复经验不应再写"
+        assert len(read_lessons(tmp)) == n1
+
+        # 落盘格式：专用小节 + [auto] 条目
+        mem = (Path(tmp) / ".minicode" / "memory.md").read_text(encoding="utf-8")
+        assert "## 自动沉淀的经验（self-improve）" in mem
+        assert "- [auto]" in mem
+
+        # forget 清空自动条目
+        removed = forget_lessons(tmp)
+        assert removed == n1
+        assert read_lessons(tmp) == []
+
+
+def test_self_improve_loop_appends_lesson_on_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        backend, profile = _scripted([], native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+
+        result = RunResult()
+        result.errors = 1
+        result.finish_reason = "finish"
+        loop._finish_blocked = 0
+
+        added = loop._run_self_improve(result)
+        assert added >= 1, "失败会话应沉淀至少一条经验"
+
+        mem = (Path(tmp) / ".minicode" / "memory.md").read_text(encoding="utf-8")
+        assert "[auto]" in mem
+        assert "## 自动沉淀的经验" in mem
+
+        # 幂等：再次同样信号不应重复追加
+        added2 = loop._run_self_improve(result)
+        assert added2 == 0, "重复信号不应追加重复经验"
+
+
+def test_self_improve_tool_digest_and_list_and_forget():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, ctx = _make_env(tmp)
+        # 模拟主循环已暂存的完整信号
+        ctx.session["_last_signal"] = {
+            "repair_rounds": 0, "tool_errors": 1, "permission_denied": 0,
+            "empty_responses": 0, "finish_blocked": 0, "compactions": 1,
+            "aborted": False, "llm_error": False,
+        }
+
+        r = registry.execute("self_improve", {"action": "digest"}, ctx)
+        assert r.ok and r.meta.get("added", 0) >= 1, r.error or r.output
+
+        r2 = registry.execute("self_improve", {"action": "list"}, ctx)
+        assert r2.ok and "经验" in r2.output
+
+        r3 = registry.execute("self_improve", {"action": "forget"}, ctx)
+        assert r3.ok and r3.meta.get("removed", 0) >= 1
+
+        r4 = registry.execute("self_improve", {"action": "list"}, ctx)
+        assert "暂无" in r4.output, "forget 后应为空"
 
 
 # ----------------------------------------------------------------------------

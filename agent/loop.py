@@ -74,6 +74,7 @@ from .tools import build_tool_context
 from .tools.base import ToolContext, ToolRegistry, ToolResult
 from .tools.meta import FINISH_SENTINEL
 from .tools.memory import read_memory_file, format_memory_section
+from .self_improve import SessionSignal, derive_lessons, record_lessons as _record_lessons
 
 __all__ = ["RunResult", "AgentLoop"]
 
@@ -423,7 +424,52 @@ class AgentLoop:
                 if self.console:
                     self.console.warn(f"备份失败（不影响任务结果）：{exc}")
 
+            # V31 自我改进：任务结束（含中断/报错）后，把本次信号沉淀成经验到项目记忆，
+            # 下次启动自动注入 system 提示词。失败绝不拖垮任务结果。
+            if self.config.auto_improve:
+                try:
+                    added = self._run_self_improve(result)
+                    if added and self.console:
+                        self.console.info(
+                            f"[self-improve] 沉淀 {added} 条经验到项目记忆"
+                            f"（.minicode/memory.md，下次启动注入）"
+                        )
+                except Exception:  # noqa: BLE001 —— 自我改进失败不影响主流程
+                    pass
+
         return result
+
+    # ------------------------------------------------------------------
+    # V31 自我改进
+    # ------------------------------------------------------------------
+    def _run_self_improve(self, result: "RunResult") -> int:
+        """把本次任务的可观测信号映射成经验，落盘到项目记忆。返回新增条数。"""
+        agg = self.metrics.aggregate()
+        signal = SessionSignal(
+            repair_rounds=int(agg.get("repair_rounds") or 0),
+            tool_errors=int(result.errors or 0),
+            permission_denied=int(self.ctx.session.get("permission_denied", 0) or 0),
+            empty_responses=int(self.ctx.session.get("empty_responses", 0) or 0),
+            finish_blocked=int(self._finish_blocked or 0),
+            compactions=int(self.history.compact_count or 0),
+            aborted=result.finish_reason == "aborted",
+            llm_error=result.finish_reason == "llm_error",
+        )
+        # 暂存完整信号，供 self_improve 工具中途 digest 时复用
+        self.ctx.session["_last_signal"] = {
+            "repair_rounds": signal.repair_rounds,
+            "tool_errors": signal.tool_errors,
+            "permission_denied": signal.permission_denied,
+            "empty_responses": signal.empty_responses,
+            "finish_blocked": signal.finish_blocked,
+            "compactions": signal.compactions,
+            "aborted": signal.aborted,
+            "llm_error": signal.llm_error,
+        }
+        lessons = derive_lessons(signal)
+        if not lessons:
+            return 0
+        return _record_lessons(self.workspace_root, lessons)
 
     # ------------------------------------------------------------------
     # 循环主体
@@ -470,6 +516,7 @@ class AgentLoop:
                         "模型连续给出空响应（无正文、无工具调用），已停止。"
                         "通常是网关抖动或模型未接上话，可直接重试本任务。"
                     )
+                    self.ctx.session["empty_responses"] = int(self.ctx.session.get("empty_responses", 0)) + 1
                     if self.console:
                         self.console.warn(result.answer)
                     return
@@ -638,6 +685,7 @@ class AgentLoop:
                         self.console.tool_result(call.name, False, rendered, meta="权限拒绝")
                     self._fingerprints.append(call.fingerprint())
                     # 被拒绝是一次"被允许的拒绝"，不计入连续失败，避免误触发 too_many_errors 自停
+                    self.ctx.session["permission_denied"] = int(self.ctx.session.get("permission_denied", 0)) + 1
                     continue
 
             tool_result = self.registry.execute(call.name, call.arguments, self.ctx, call_id=call.id)

@@ -25,10 +25,10 @@ def build_default_registry(include: Optional[list] = None) -> ToolRegistry:
     Args:
         include: 可选白名单，仅注册指定类别，如 ["文件", "执行"]。
     """
-    from . import filesystem, meta, patch, repair, review, search, shell, todo, extra, git_tool, memory, fsops, recall, replace_files, lint, summary, agent
+    from . import filesystem, meta, patch, repair, review, search, shell, todo, extra, git_tool, memory, fsops, recall, replace_files, lint, summary, agent, self_improve
 
     registry = ToolRegistry()
-    modules = [filesystem, search, shell, meta, repair, review, patch, todo, extra, git_tool, memory, fsops, recall, replace_files, lint, summary, agent]
+    modules = [filesystem, search, shell, meta, repair, review, patch, todo, extra, git_tool, memory, fsops, recall, replace_files, lint, summary, agent, self_improve]
     for mod in modules:
         mod.register(registry)
 

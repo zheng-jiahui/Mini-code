@@ -41,6 +41,10 @@
 | V9 | 质量指标（做对了没有） | ✅ 已完成 |
 | V10 | 评测台（以产物为准） | ✅ 已完成 |
 | V11 | 评测任务集 5→10（每任务一维度） | ✅ 已完成 |
+| V28 | 权限系统（permission_mode） | ✅ 已完成 |
+| V29 | 子任务编排（delegate 受控子智能体） | ✅ 已完成 |
+| V30 | 后台命令（run_command 后台 + check/kill） | ✅ 已完成 |
+| V31 | 自我改进钩子（失败→记忆→更聪明） | ✅ 已完成 |
 
 ---
 
@@ -833,3 +837,24 @@ LRU 的断言把 `put(4,4)` 后该淘汰的键写成了 1（实际是 3，因为
   **跑本项目自己的脚本时不要加**，直接调用受管 Python 即可。
 - 表格对齐：Python 的 `f'{s:<n}'` 按**字符数**补齐，中文报告要按
   **East Asian Width** 算显示宽度（W/F 记 2 列），否则整列错位。
+
+---
+
+## V28–V31 贴近商业 code agent 的四连击（2026-08-31 夜间，用户授权持续迭代）
+
+在「零框架、自实现核心」已达标的基础上，按「最像商业 code agent 的差距」逐版本补齐：
+
+- **V28 权限系统**（`agent/config.py` + `agent/loop.py`）：`permission_mode`（auto/ask/read_only）
+  门控 8 个写/破坏性工具；`ask` 无交互环境退化为自动放行，拒绝不计入连续失败。提交见 git log。
+- **V29 子任务编排**（`agent/tools/agent.py`）：`delegate` 派发受控子智能体，拆大任务为可验证小块、
+  降父上下文压力；机制上禁递归（剔 delegate）、不能反问（剔 ask_user）、独立步数预算、失败不拖垮父任务。
+- **V30 后台命令**（`agent/tools/shell.py`）：`run_command` 传 `background=true` 立即返回 `job_id`，
+  `check_command` 读实时输出、`kill_command` 终止，可后台起服务/跑长任务。
+- **V31 自我改进钩子**（`agent/self_improve.py` + `agent/tools/self_improve.py` + `agent/loop.py`）：
+  任务结束把本次「失败/修复/中断/压缩」信号沉淀成可泛化经验，落盘 `.minicode/memory.md`
+  （与 `memory` 共用同一文件、标 `[auto]`、去重封顶），下次启动自动注入 system 提示词，
+  形成「失败→记忆→下次更聪明」闭环（类比 Claude Code / Codex 记忆自更新）。
+  纯本地、确定性、不依赖模型，因此完全离线可测；`self_improve` 工具另支持中途 `digest`/`list`/`forget`。
+
+**答辩要点**：这四项是「agent 不只是一个执行器，而是有边界、能分身、能异步、能从错误中学习」的体现；
+全部建立在自建的 AgentLoop + ToolRegistry 之上，零框架、零服务端工具，符合考核硬约束。

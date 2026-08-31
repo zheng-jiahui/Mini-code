@@ -68,6 +68,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 │   ├── metrics.py            # 质量指标：结局分布 / 自修复回合 / 返工
 │   ├── checkpoint.py         # 会话检查点：跨进程续跑
 │   ├── eval.py               # 评测台：10 个标准任务，验证产物
+│   ├── self_improve.py       # 自我改进钩子：把会话信号沉淀成经验到项目记忆
 │   └── tools/
 │       ├── base.py           # ToolSpec / ToolRegistry / ToolResult（自建工具系统）
 │       ├── filesystem.py     # read_file / write_file / edit_block / list_dir
@@ -86,7 +87,8 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 │       ├── replace_files.py  # replace_in_files：跨文件安全查找替换（仓库级重命名，默认 dry_run）
 │       ├── lint.py           # lint：代码检查（零配置 Python 语法体检 + 结构化解析 linter 输出）
 │       ├── summary.py        # summary：会话改动概览（可粘贴进 PR / 提交说明 / 交接）
-│       └── agent.py          # delegate：派发受控子智能体（子任务编排，防递归、独立步数预算）
+│       ├── agent.py          # delegate：派发受控子智能体（子任务编排，防递归、独立步数预算）
+│       └── self_improve.py    # self_improve：自我改进工具（digest / list / forget）
 ├── docs/DESIGN.md            # 完整设计说明（主循环流程图、接口定义、错误策略等）
 └── tests/                    # 冒烟测试（Mock 后端，无需 API key）
 ```
@@ -97,7 +99,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 
 | 能力 | 说明 |
 |---|---|
-| 工具（共 30 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file` `move_file` `copy_file` `delete` `replace_in_files`（跨文件替换）；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch` `recall`（相关文件检索）；执行：`run_command`（含后台 `check_command`/`kill_command`）；检查：`lint`（代码检查）；版本控制：`git`（受控提交 + 只读 + add）；编排：`delegate`（受控子智能体）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签）`memory`（项目记忆）；汇报：`summary`（会话改动概览） |
+| 工具（共 31 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file` `move_file` `copy_file` `delete` `replace_in_files`（跨文件替换）；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch` `recall`（相关文件检索）；执行：`run_command`（含后台 `check_command`/`kill_command`）；检查：`lint`（代码检查）；版本控制：`git`（受控提交 + 只读 + add）；编排：`delegate`（受控子智能体）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签）`memory`（项目记忆）`self_improve`（自我改进）；汇报：`summary`（会话改动概览） |
 | 双通道调用 | 优先原生 `tool_calls`；模型不支持时自动切到 ```json 文本协议 |
 | 上下文管理 | token 估算 → 工具回执智能压缩（信号行优先）→ 超阈值摘要压缩 → 硬截断兜底 |
 | 长程记忆 | **常驻事实层**：硬约束/技术选型/已失败方案常驻且不参与再压缩，避免"摘要的摘要"式衰减；压缩后重建工作区真实清单 |
@@ -121,6 +123,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 | 跨文件替换 | `replace_in_files` 按 glob 圈定一批文件，把某段文本（或正则）全部替换（仓库级符号重命名）；默认 `dry_run=true` 仅预览会动哪些文件/几处，确认后再落盘；写前逐文件备份可 /undo 回滚，二进制文件自动跳过 |
 | 子任务编排 | `delegate` 派发受控子智能体：大任务拆成可独立验证的小块、降低父任务上下文压力（类比 Claude Code 的 Task / Codex 子代理）。子智能体复用同一工作区与模型端点、拥有独立上下文与步数预算；**机制上杜绝递归**（剔除 `delegate`）、**不能反问用户**（剔除 `ask_user`）、关闭检查点/会话落盘写入避免污染父任务；其失败不拖垮父任务 |
 | 后台命令 | `run_command` 传 `background=true` 立即返回 `job_id` 不阻塞，之后用 `check_command(job_id)` 读实时输出、`kill_command(job_id)` 终止——可后台起开发服务器 / 跑长任务，边等边干别的（类比 Claude Code 的后台 shell） |
+| 自我改进 | `self_improve` 把本次任务的失败/修复/中断/压缩信号沉淀成可泛化的经验，落盘到项目记忆 `.minicode/memory.md`（与 `memory` 共用同一文件，标 `[auto]` 且去重封顶），下次启动自动注入 system 提示词——形成「失败 → 记忆 → 下次更聪明」闭环（类比 Claude Code / Codex 的记忆自更新）。任务结束主循环自动 digest；agent 也可中途 `digest` / `list` / `forget` |
 | 代码检查 | `lint` 写完代码、finish 前先自查：不传 command 时对 Python 文件做零配置语法体检（内置 compile，纯标准库），传 command 时运行你给的检查器（如 `ruff check .`）并结构化解析 `文件:行: 信息`；只读护栏禁止 `--fix` 等改写选项，可据此逐条修复 |
 | 会话概览 | `summary` 把本次会话的改动整理成可粘贴的概览：哪些文件新建/修改/删除、各加减多少行、本次任务是什么，适合直接贴进 PR 描述 / 提交说明 / 交接；与 /diff（逐行 diff）、/stats（质量指标）三者互补 |
 

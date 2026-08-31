@@ -124,6 +124,10 @@ class AgentConfig:
     # usage，成本对账不受影响；网关不支持时后端会自动退回整包，不会变成可用性风险。
     stream: bool = True
     session_log: Optional[str] = ".agent_sessions"
+    # V31 自我改进：任务结束时自动把失败/修复/中断信号沉淀成经验，落盘到项目记忆
+    # （.minicode/memory.md），下次启动注入 system 提示词。默认开启；可在 config.yaml
+    # 设 auto_improve: false 关闭。
+    auto_improve: bool = True
 
     # 每个任务在 workspace 下开一个独立子目录（<时间戳>-<任务摘要>），
     # 该任务的代码、.agent_backups 备份、.agent_sessions 日志都归拢在里面。
