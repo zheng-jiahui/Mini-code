@@ -68,6 +68,7 @@ def _count_and_replace(text: str, is_regex: bool, old: str, new: str) -> Tuple[i
 
 @tool_spec(
     name="replace_in_files",
+    dangerous=True,
     description=(
         "在圈定的一批文件里，把某段文本（或正则）**全部替换**——用于仓库级符号重命名、"
         "统一改 API 名、批量修同一个笔误。按 include 通配符（如 *.py）圈定范围，从 path 开始递归。"

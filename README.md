@@ -104,6 +104,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 | 自修复 | 运行失败自动定位 traceback 并附上出错位置源码、测试命令自动识别、修复预算、一键回滚 |
 | 循环控制 | 步数上限、token 预算、连续错误上限、重复调用指纹去重、假完成拦截、用户 Ctrl-C 中断 |
 | 安全 | 工作区路径沙箱、危险命令拦截/二次确认、命令超时（带上限夹取）、写前自动备份 |
+| 权限系统 | 写/破坏性操作（write_file/edit_block/apply_patch/delete/move_file/copy_file/replace_in_files/run_command）按 `permission_mode` 放行：`auto` 直接执行（默认，无头/脚本不动）、`ask` 执行前交互确认、`read_only` 只放行只读工具（安全审查"只看不动"）；REPL 内 `/mode` 实时切换，拒绝不计入连续失败 |
 | 可观测 | 每步打印「思考 / 工具调用 / 结果 / 耗时」，流式输出，`/diff` 审阅改动、`/stats` 成本与瓶颈面板，会话可存 JSONL 复盘 |
 | 质量指标 | `/stats` 也回答"做对了没有"：结局分布、失败率、自修复回合数、返工 |
 | 评测台 | `python -m agent.eval`：10 个标准任务，**以产物能否跑通为准**（不采信模型自述），并标出假完成 / 悲观失败 |

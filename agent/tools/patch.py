@@ -102,6 +102,7 @@ def _apply_hunk(old_lines: List[str], hunk: dict) -> Tuple[Optional[int], Option
 
 @tool_spec(
     name="apply_patch",
+    dangerous=True,
     description=(
         "把一段标准 unified diff（由 `@@` 分隔的 hunk 组成）应用到指定文件，"
         "常用于把模型给出的改动一次性落到文件里。只改已存在的文件，且会自动备份原文。"

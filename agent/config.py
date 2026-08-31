@@ -112,6 +112,11 @@ class AgentConfig:
 
     restrict_to_workspace: bool = True
     command_policy: str = "confirm"      # allow | confirm | deny
+    # 写/破坏性操作的权限模式（Claude Code 式权限系统的核心）：
+    #   auto      —— 直接执行（默认，保持无头/脚本/测试场景的向后兼容，不阻断）
+    #   ask       —— 执行前交互确认；无交互环境（console=None）下退化为自动放行（default=True）
+    #   read_only —— 一律拒绝写/破坏性操作，只放行只读工具（适合"只看不动"的安全审查
+    permission_mode: str = "auto"        # auto | ask | read_only
     backup_on_write: bool = True
     backup_dir: str = ".agent_backups"
     # 边生成边打印。此前一直是 False 且**没有任何代码读它**——又一个"声明了没实现"的字段。
@@ -447,6 +452,12 @@ def load_config(
         raise ConfigError(
             f"command_policy 必须是 allow/confirm/deny 之一，当前为 {agent.command_policy!r}",
             policy=agent.command_policy,
+        )
+
+    if agent.permission_mode not in ("auto", "ask", "read_only"):
+        raise ConfigError(
+            f"permission_mode 必须是 auto/ask/read_only 之一，当前为 {agent.permission_mode!r}",
+            policy=agent.permission_mode,
         )
 
     ws = agent.resolved_workspace()

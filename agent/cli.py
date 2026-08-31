@@ -42,6 +42,7 @@ BANNER_HELP = """\
   /save [路径]       把当前对话导出为 JSONL
   /checkpoint        手动保存会话检查点（下次可用 --resume 续跑）
   /resume [路径]     从检查点恢复会话（默认取最近一次）
+  /mode [auto|ask|read_only]   切换写/破坏性操作的权限模式（默认 auto）
   !<命令>            直接执行 shell 命令（不经过模型）
 其余内容作为自然语言任务发送给智能体。
 """
@@ -89,6 +90,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--base-url", help="覆盖 API 端点")
     p.add_argument("--temperature", type=float, help="覆盖采样温度")
     p.add_argument("--max-steps", type=int, help="覆盖单任务最大步数")
+    p.add_argument("--permission-mode", choices=["auto", "ask", "read_only"],
+                   help="写/破坏性操作的权限模式：auto(默认,直接执行) / ask(执行前确认) / read_only(只放行只读工具)")
     p.add_argument("--backend", choices=["auto", "sdk", "http", "mock"], default="auto", help="LLM 后端实现")
     p.add_argument("--mock", action="store_true", help="离线演示模式（不发网络请求）")
     p.add_argument("--list-tools", action="store_true", help="列出所有工具后退出")
@@ -122,6 +125,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "temperature": args.temperature,
         "workspace": args.workspace,
         "max_steps": args.max_steps,
+        "permission_mode": args.permission_mode,
     }
     # 离线演示模式不需要真实凭据
     is_mock = args.mock or args.backend == "mock"
@@ -273,6 +277,22 @@ def _repl(loop: AgentLoop, console: Console) -> int:
                     console.echo(f"  {k} = {getattr(loop.config, k)}")
             elif cmd == "/stats":
                 console.echo(loop.build_stats_panel())
+            elif cmd == "/mode":
+                parts = raw.split(maxsplit=1)
+                cur = getattr(loop.config, "permission_mode", "auto")
+                if len(parts) > 1 and parts[1].strip() in ("auto", "ask", "read_only"):
+                    loop.config.permission_mode = parts[1].strip()
+                    console.info(
+                        f"权限模式已切换为：{loop.config.permission_mode}"
+                        "（auto=直接执行 / ask=执行前确认 / read_only=只放行只读工具）"
+                    )
+                else:
+                    console.echo(
+                        f"用法：/mode [auto|ask|read_only]    当前模式：{cur}\n"
+                        "  auto      —— 写/破坏性操作直接执行（默认）\n"
+                        "  ask       —— 执行前交互确认（无交互环境自动放行）\n"
+                        "  read_only —— 只放行只读工具，拒绝一切写/破坏性操作"
+                    )
             elif cmd == "/diff":
                 from .tools.review import build_diff
                 console.echo(build_diff(loop.ctx.session.get("changes", [])))

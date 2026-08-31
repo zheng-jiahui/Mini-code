@@ -16,7 +16,7 @@
    workplace/任务名/                          该任务的最新代码
    .agent_backups/任务名_时间戳_第N次/        每次生成的完整归档，序号自动递增
    .overwrites/                              覆盖写单文件备份，供 /undo 回滚
-5) 测试：python tests/test_smoke.py（115 个用例，无需 API key）
+5) 测试：python tests/test_smoke.py（116 个用例，无需 API key）
         python tests/test_fake_server.py（本地假服务端，验证 HTTP 协议链路）
 
 二、特色功能
@@ -48,6 +48,12 @@
     system 提示词（类比 CLAUDE.md/AGENTS.md），下次会话免从零探索，且可 append 持续积累。
 15. 文件增删齐备：move_file/copy_file/delete 补足文件的移动/复制/删除；delete 删前先备份到
     .agent_backups 可恢复，删目录需 recursive=true，越界路径一律拒绝。
+16. 权限系统（贴近 Claude Code）：写/破坏性操作（write_file/edit_block/apply_patch/delete/
+    move_file/copy_file/replace_in_files/run_command）按 permission_mode 放行——
+    auto 直接执行（默认，无头/脚本不动）、ask 执行前交互确认（无交互环境自动放行）、
+    read_only 只放行只读工具（安全审查可"只看不动"）；REPL 内 /mode 实时切换。
+17. 可干预：ask_user 在信息不足时反问用户、finish 收尾前若改了文件却没验证会被拦下先验证；
+    危险命令黑名单(deny/confirm) 与 permission_mode 双保险。
 
 三、其它
 - 架构图、System Prompt、工具规范、接口与错误分层见 docs/DESIGN.md。

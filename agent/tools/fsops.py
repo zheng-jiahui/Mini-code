@@ -29,6 +29,7 @@ _MAX_DIR_BACKUP_BYTES = 5_000_000  # 超过此体量的目录删除前不备份�
 # ----------------------------------------------------------------------------
 @tool_spec(
     name="move_file",
+    dangerous=True,
     description=(
         "移动 / 重命名文件或目录（在沙箱内）。默认目标已存在则拒绝，避免误覆盖；"
         "确需覆盖时传 overwrite=true（会先备份目标）。"
@@ -80,6 +81,7 @@ def move_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 # ----------------------------------------------------------------------------
 @tool_spec(
     name="copy_file",
+    dangerous=True,
     description=(
         "复制文件或目录到目标（在沙箱内）。默认目标已存在则拒绝；"
         "确需覆盖时传 overwrite=true（会先备份目标）。复制目录会递归。"
@@ -131,6 +133,7 @@ def copy_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 # ----------------------------------------------------------------------------
 @tool_spec(
     name="delete",
+    dangerous=True,
     description=(
         "删除文件或目录（在沙箱内）。删除前会先备份到 .agent_backups，可恢复。\n"
         "删除目录必须传 recursive=true；误删文件可用 .agent_backups 找回。"

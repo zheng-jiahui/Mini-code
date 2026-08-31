@@ -620,6 +620,25 @@ class AgentLoop:
                 self.ctx.session["summary"] = summary
                 return "finish"
 
+            # ---- 权限门：写/破坏性操作按 permission_mode 处理 ----
+            # 只读工具（read_file/grep_search/...）不会进这里——它们不标 dangerous；
+            # 这里只拦 write_file/edit_block/apply_patch/delete/move_file/copy_file/
+            # replace_in_files/run_command 这类写或破坏性工具。
+            spec = self.registry.get(call.name)
+            if spec is not None:
+                denied = self._permission_check(spec, call)
+                if denied is not None:
+                    rendered = denied.render(max_chars=int(self.config.max_tool_output_chars))
+                    style = "native" if call.source == "native" else "text"
+                    self.history.add_tool_result(call.id, call.name, rendered, style=style)
+                    self._emit("tool_result", {"name": call.name, "ok": False,
+                                               "output": rendered[:400], "permission_denied": True})
+                    if self.console:
+                        self.console.tool_result(call.name, False, rendered, meta="权限拒绝")
+                    self._fingerprints.append(call.fingerprint())
+                    # 被拒绝是一次"被允许的拒绝"，不计入连续失败，避免误触发 too_many_errors 自停
+                    continue
+
             tool_result = self.registry.execute(call.name, call.arguments, self.ctx, call_id=call.id)
             # 累计各工具耗时与调用次数（成本面板的"各工具耗时占比"用）
             self._tool_timings[call.name] = self._tool_timings.get(call.name, 0.0) + tool_result.elapsed
@@ -708,6 +727,47 @@ class AgentLoop:
             self._fingerprints.append(c.fingerprint())
 
         return None
+
+    def _permission_check(self, spec: "ToolSpec", call: "ToolCall") -> Optional[ToolResult]:
+        """权限门：根据 config.permission_mode 决定是否放行写/破坏性（dangerous）工具。
+
+        - auto      → 直接放行（默认；无头/测试/脚本场景不阻断，保持向后兼容）。
+        - read_only → 一律拒绝，回灌「权限不足」提示，逼模型改用只读工具或请用户切模式。
+        - ask       → 交互确认；无 console 时退化为自动放行（default=True），避免无头卡死。
+
+        返回 None 表示放行；返回 ToolResult（ok=False, meta.permission_denied=True）表示拒绝。
+        被拒绝时不计入「连续失败」——它是一次被系统允许的拒绝，不该触发 too_many_errors 自停。
+        """
+        mode = getattr(self.config, "permission_mode", "auto")
+        if not spec.dangerous or mode == "auto":
+            return None
+
+        args_preview = json.dumps(call.arguments, ensure_ascii=False)
+        if len(args_preview) > 200:
+            args_preview = args_preview[:200] + "…"
+
+        if mode == "read_only":
+            return ToolResult.failure(
+                f"权限不足：当前为「只读模式」，不允许执行写/破坏性操作 `{call.name}`。\n"
+                "请改用在当前模式下被允许的做法（仅用 read_file / grep_search / find_files / "
+                "diff / recall / summary / web_fetch 等只读工具），或请用户切到 auto / ask 模式。",
+                hint="用 /mode auto 或 /mode ask 放开写权限",
+                meta={"permission_denied": True, "tool": call.name},
+            )
+
+        # ask 模式：交互确认（无 console 时 confirm 返回 default=True，即自动放行）
+        allowed = self.ctx.confirm(
+            f"「{call.name}」是写/破坏性操作，是否允许执行？参数：{args_preview}",
+            default=True,
+        )
+        if allowed:
+            return None
+        return ToolResult.failure(
+            f"已拒绝执行 `{call.name}`（需用户授权）。请改用在当前模式下被允许的做法，"
+            "或请用户用 /mode auto 放开权限后再试。",
+            hint="用户拒绝了该写操作",
+            meta={"permission_denied": True, "tool": call.name},
+        )
 
     def _finalize_after_tools(self, reason: str, result: RunResult) -> None:
         """工具阶段触发的结束处理。"""

@@ -2879,6 +2879,64 @@ def test_summary_recaps_session_changes():
         assert r3.ok and "还没有任何改动记录" in r3.output
 
 
+def test_permission_mode_gates_dangerous_tools():
+    from agent.loop import AgentLoop
+    from agent.llm import ToolCall
+
+    # --- 单元测试：_permission_check 按模式放行/拒绝 ---
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp)
+        loop = AgentLoop(cfg, profile, _scripted([], native=True)[0], registry, console=None)
+        spec = registry.get("write_file")
+        assert spec is not None and spec.dangerous, "write_file 应标记为 dangerous"
+        call = ToolCall(id="c1", name="write_file", arguments={"path": "a.py", "content": "x"})
+
+        # auto：直接放行
+        cfg.permission_mode = "auto"
+        assert loop._permission_check(spec, call) is None
+
+        # read_only：一律拒绝
+        cfg.permission_mode = "read_only"
+        denied = loop._permission_check(spec, call)
+        assert denied is not None and not denied.ok
+        assert denied.meta.get("permission_denied") is True
+
+        # ask + 无 console：退化为自动放行（default=True），避免无头环境卡死
+        cfg.permission_mode = "ask"
+        loop.ctx.console = None
+        assert loop._permission_check(spec, call) is None
+
+        # ask + 用户拒绝：返回拒绝结果
+        loop.ctx.confirm = lambda q, default=True: False
+        denied2 = loop._permission_check(spec, call)
+        assert denied2 is not None and not denied2.ok
+        assert denied2.meta.get("permission_denied") is True
+
+        # 只读工具（read_file）不标 dangerous，任何模式下都不被本门拦截
+        ro_spec = registry.get("read_file")
+        assert ro_spec is not None and not ro_spec.dangerous
+        cfg.permission_mode = "read_only"
+        assert loop._permission_check(
+            ro_spec, ToolCall(id="r", name="read_file", arguments={"path": "a.py"})) is None
+
+    # --- 端到端：read_only 模式下 write_file 被拒、文件不应生成、不计入失败 ---
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, _ = _make_env(tmp, permission_mode="read_only")
+        script = [
+            {"content": "尝试写文件。", "tool_calls": [
+                {"name": "write_file", "arguments": {"path": "a.py", "content": "print(1)\n"}}]},
+            {"content": "完成。", "tool_calls": [{"name": "finish", "arguments": {"summary": "ok"}}]},
+        ]
+        backend, _ = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        result = loop.run("在只读模式下干活")
+        assert not (Path(tmp) / "a.py").exists(), "只读模式不应写出文件"
+        assert result.finish_reason == "finish"
+        assert result.errors == 0, "权限拒绝不应计入连续失败"
+        assert any("权限不足" in (m.get("content") or "") for m in loop.history.messages), \
+            "被拒的写操作应回灌『权限不足』提示给模型"
+
+
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0

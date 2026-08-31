@@ -204,6 +204,7 @@ def write_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 # ----------------------------------------------------------------------------
 @tool_spec(
     name="edit_block",
+    dangerous=True,
     description=(
         "精确替换文件中的一段文本：用 old_text 定位，替换成 new_text，文件其余部分原样保留。\n"
         "old_text 在文件中必须**唯一**；若不唯一，会返回每一处的行号，"
