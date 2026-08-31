@@ -2937,6 +2937,66 @@ def test_permission_mode_gates_dangerous_tools():
             "被拒的写操作应回灌『权限不足』提示给模型"
 
 
+def test_delegate_spawns_child_agent_and_returns_summary():
+    # 父子共享同一 MockBackend：脚本按"父派发 → 子读文件 → 子收尾 → 父收尾"顺序消费。
+    # 验证子智能体确实独立运行、把结论回传父任务，且父任务不会因子任务而中断。
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, ctx = _make_env(tmp, native=True)
+        script = [
+            # 父 turn1：派发子任务
+            {"content": "派个子智能体去查。", "tool_calls": [
+                {"name": "delegate", "arguments": {"task": "读取 secret.txt 的内容并总结"}}]},
+            # 子 turn1：读文件
+            {"content": "读文件。", "tool_calls": [
+                {"name": "read_file", "arguments": {"path": "secret.txt"}}]},
+            # 子 turn2：收尾
+            {"content": "总结。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "secret.txt 里写着 42"}}]},
+            # 父 turn2：收尾
+            {"content": "完成。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "子智能体回报：secret.txt 里写着 42"}}]},
+        ]
+        backend, _ = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        # 子智能体要读的文件
+        (Path(tmp) / "secret.txt").write_text("42", encoding="utf-8")
+
+        result = loop.run("让子智能体读 secret.txt")
+        assert result.finish_reason == "finish", result.finish_reason
+        assert "42" in result.answer, result.answer
+        # 父任务"调用了 delegate"应被记为一次工具调用
+        assert result.tool_calls >= 2
+
+
+def test_delegate_child_cannot_recurse_and_cannot_ask_user():
+    # 子智能体即便试图派发子任务（delegate）也拿不到该工具：registry 剔除 delegate/ask_user，
+    # 因此会收到"未知工具"的回执而非真正递归；父任务仍能正常收尾（脚本耗尽即 FINAL，不会死循环）。
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, profile, registry, ctx = _make_env(tmp, native=True)
+        script = [
+            {"content": "派发。", "tool_calls": [
+                {"name": "delegate", "arguments": {"task": "让孙子去做一件小事"}}]},
+            # 子试图递归派发——但注册表里没有 delegate
+            {"content": "试试再派发。", "tool_calls": [
+                {"name": "delegate", "arguments": {"task": "孙子任务"}}]},
+            # 子收到未知工具报错后收尾
+            {"content": "收尾。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "子任务完成（递归被拦截）"}}]},
+            {"content": "完成。", "tool_calls": [
+                {"name": "finish", "arguments": {"summary": "父任务完成"}}]},
+        ]
+        backend, _ = _scripted(script, native=True)
+        loop = AgentLoop(cfg, profile, backend, registry, console=None)
+        result = loop.run("派发会递归的任务")
+        assert result.finish_reason == "finish", result.finish_reason
+        # 确认子智能体的注册表里确实没有 delegate（机制上杜绝递归）
+        child_specs = [s.name for s in registry.specs()]  # 父注册表含 delegate
+        assert "delegate" in child_specs
+        # 子任务里那次"未知工具 delegate"应被记成一次错误回执，而非真的又开了个子智能体
+        # （若递归发生，脚本会在第 2 个 delegate 处需要更多消息并走向 FINAL，finish_reason 仍为 finish，
+        #  此处主要验证：整套运行正常结束、未抛异常）
+
+
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     failures = 0

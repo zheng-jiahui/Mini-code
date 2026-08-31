@@ -179,6 +179,7 @@ class AgentLoop:
         )
         self.history = History(self.system_prompt)
         self.ctx: ToolContext = build_tool_context(config, console=console, session={})
+        self.ctx.loop = self   # 反向引用：编排类工具（如 delegate）可据此派发受控子智能体
 
         # 任务级工作区：workspace_root 是"所有生成代码的家"，
         # 每个具体任务会在它下面拥有一个独立子目录（见 prepare_task_dir）。

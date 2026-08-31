@@ -16,44 +16,43 @@
    workplace/任务名/                          该任务的最新代码
    .agent_backups/任务名_时间戳_第N次/        每次生成的完整归档，序号自动递增
    .overwrites/                              覆盖写单文件备份，供 /undo 回滚
-5) 测试：python tests/test_smoke.py（116 个用例，无需 API key）
+5) 测试：python tests/test_smoke.py（118 个用例，无需 API key）
         python tests/test_fake_server.py（本地假服务端，验证 HTTP 协议链路）
 
 二、特色功能
-1. 零框架：未使用 LangChain / LlamaIndex / OpenAI Agents SDK / AutoGen / CrewAI 等任何 Agent 框架，
+1. 零框架：未用任何 Agent 框架（LangChain/LlamaIndex/OpenAI Agents SDK/AutoGen/CrewAI），
    仅用 OpenAI 兼容聊天补全客户端；对话历史、工具、解析、循环、压缩、错误全部自写。
-2. 双通道工具调用：优先原生 function calling；模型/网关不支持时自动切换 ```json 文本协议 + 自写解析校验纠错。
-3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环（共 27 个）：
+2. 双通道工具调用：优先原生 function calling；不支持时自动切换 ```json 文本协议 + 自写解析校验纠错。
+3. 自建工具系统 ToolSpec+ToolRegistry+ToolResult，新增工具不改主循环（共 28 个）：
    read_file / write_file / edit_block / apply_patch / read_many_files / replace_in_file /
-   move_file / copy_file / delete(删前备份) / replace_in_files(跨文件替换) / list_dir / run_command / lint(代码检查) /
+   move_file / copy_file / delete(删前备份) / replace_in_files(跨文件) / list_dir / run_command / lint(检查) /
    grep_search(支持上下文) / find_files / web_fetch / diff / recall(相关文件检索) /
-   git(受控提交/只读) / plan / finish / ask_user / rollback / todo(任务清单) / think(推理便签) /
-   memory(项目记忆) / summary(会话概览)。
-4. 上下文治理：tiktoken 精确 token 计数 + 工具回执智能压缩（信号行优先）+ 超阈值摘要压缩兜底；
-   /stats 面板报真实 token、各工具耗时占比与时间去向（实测等模型约九成，瓶颈一目了然）。
+   git(受控提交/只读) / delegate(受控子智能体) / plan / finish / ask_user / rollback / todo(任务清单) /
+   think(推理便签) / memory(项目记忆) / summary(会话概览)。
+4. 上下文治理：tiktoken 精确 token 计数 + 回执智能压缩（信号行优先）+ 超阈值摘要压缩兜底；
+   /stats 报真实 token 与各工具耗时占比。
 5. 循环控制：步数/连续失败上限、重复调用指纹去重、解析纠错回灌、Ctrl-C 保留历史。
-6. 自修复闭环：识别测试命令、定位 traceback 并回灌源码上下文、连续失败预算提醒、rollback 一键回滚。
+6. 自修复闭环：识别测试命令、定位 traceback 并回灌源码上下文、连续失败预算提醒、一键回滚。
 7. 可靠性：中文 GBK 正确解码、交互式挂死检测、假完成拦截（改文件须先验证再 finish）。
 8. 安全可回滚：路径沙箱、危险命令黑名单(deny/confirm)、命令超时杀进程树、覆盖写自动备份、输出密钥脱敏。
-9. 可观测：流式输出（正文逐字实时打印，网关不支持时自动退回整包）、每步打印思考/调用/回执/耗时；
-   会话落盘 JSONL。
-10. 可审阅性：/diff 查看本次会话的 unified diff；rollback 支持单文件级回退（只恢复指定文件）。
-11. 自主性增强：自动识别项目画像（语言/框架/构建/测试命令）注入提示词，让模型先看清新项目再动手；
-   plan 工具支持复杂任务"先列计划再执行"；一轮内的多个只读调用（read/grep/list/diff）并行发出，缩短等待。
-12. 改动落地更全：apply_patch 工具把标准 unified diff 落到已存在文件（多 hunk、上下文匹配容错、
-   任一 hunk 对不上即整体失败不写盘），不依赖外部 patch/git 二进制；diff 工具与之配合可"先看改动再打补丁"。
-13. 更贴近商业 code agent：todo 任务清单防漏做、read_many_files 批量读、replace_in_file/replace_in_files 单文件与跨文件替换、
-   web_fetch 自读在线文档/RFC/API 说明、recall 按相关度定位文件（模糊意图不必知道函数名）、安全受控 git（可常规提交、禁改写历史选项）、think 推理便签；一轮内多个只读调用并行发出。
-14. 跨会话项目记忆：memory 工具把「约定/踩坑/选型」落盘 .minicode/memory.md，启动时自动注入
-    system 提示词（类比 CLAUDE.md/AGENTS.md），下次会话免从零探索，且可 append 持续积累。
-15. 文件增删齐备：move_file/copy_file/delete 补足文件的移动/复制/删除；delete 删前先备份到
-    .agent_backups 可恢复，删目录需 recursive=true，越界路径一律拒绝。
-16. 权限系统（贴近 Claude Code）：写/破坏性操作（write_file/edit_block/apply_patch/delete/
-    move_file/copy_file/replace_in_files/run_command）按 permission_mode 放行——
+9. 可观测：流式输出、每步打印思考/调用/回执/耗时；会话落盘 JSONL。
+10. 可审阅性：/diff 看本次会话 unified diff；rollback 支持单文件级回退。
+11. 自主性增强：自动识别项目画像注入提示词；plan 工具支持复杂任务先列计划再执行；一轮内多个只读调用并行发出。
+12. 改动落地更全：apply_patch 把标准 unified diff 落到已存在文件（多 hunk、上下文容错、对不上即整体失败不写盘），不依赖外部 patch/git；diff 工具配合可先看改动再打补丁。
+13. 贴近商业 code agent：在 todo/read_many_files/全局替换/web_fetch/recall/受控 git/think 之上，
+   又加了权限系统(16)、可干预(17)、子任务编排(18)。
+14. 跨会话项目记忆：memory 把「约定/踩坑/选型」落盘 .minicode/memory.md，启动时自动注入
+    system 提示词（类比 CLAUDE.md），下次免从零探索，可 append 持续积累。
+15. 文件增删齐备：move_file/copy_file/delete 补足移动/复制/删除；delete 删前先备份到
+    .agent_backups 可恢复，删目录需 recursive=true，越界拒绝。
+16. 权限系统（贴近 Claude Code）：写/破坏性操作按 permission_mode 放行——
     auto 直接执行（默认，无头/脚本不动）、ask 执行前交互确认（无交互环境自动放行）、
     read_only 只放行只读工具（安全审查可"只看不动"）；REPL 内 /mode 实时切换。
-17. 可干预：ask_user 在信息不足时反问用户、finish 收尾前若改了文件却没验证会被拦下先验证；
+17. 可干预：ask_user 信息不足时反问用户；finish 收尾前改了文件却没验证会被拦下先验证；
     危险命令黑名单(deny/confirm) 与 permission_mode 双保险。
+18. 子任务编排（贴近 Claude Code Task / Codex 子代理）：delegate 派发受控子智能体，拆大任务为
+    可独立验证小块、降父任务上下文压力；子智能体复用工作区与模型、独立上下文与步数预算，
+    机制上禁递归(剔 delegate)、不能反问(剔 ask_user)、不污染父任务检查点，失败不拖垮父任务。
 
 三、其它
 - 架构图、System Prompt、工具规范、接口与错误分层见 docs/DESIGN.md。

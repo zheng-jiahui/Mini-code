@@ -44,6 +44,9 @@ class ToolContext:
     config: Any                       # AgentConfig
     console: Any = None               # Console（可为 None，便于单测）
     session: Dict[str, Any] = field(default_factory=dict)
+    # 反向引用父循环：仅在有 AgentLoop 驱动时由 loop 挂上，便于 delegate 等编排类工具
+    # 派发受控子智能体。无头单测场景下为 None（delegate 会据此返回友好报错，而非崩溃）。
+    loop: Any = None
 
     # --- 便捷方法 ---
     def resolve(self, path: str, **kwargs) -> Path:
