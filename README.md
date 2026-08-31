@@ -71,7 +71,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 │   └── tools/
 │       ├── base.py           # ToolSpec / ToolRegistry / ToolResult（自建工具系统）
 │       ├── filesystem.py     # read_file / write_file / edit_block / list_dir
-│       ├── shell.py          # run_command
+│       ├── shell.py          # run_command（含后台模式 check_command / kill_command 管理长任务）
 │       ├── search.py         # grep_search（支持 context 上下文）/ find_files
 │       ├── recall.py         # recall：按相关度检索最相关文件与片段（模糊意图定位）
 │       ├── patch.py          # apply_patch（自实现 unified diff 应用器，不依赖外部 patch/git）
@@ -97,7 +97,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 
 | 能力 | 说明 |
 |---|---|
-| 工具（共 28 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file` `move_file` `copy_file` `delete` `replace_in_files`（跨文件替换）；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch` `recall`（相关文件检索）；执行：`run_command`；检查：`lint`（代码检查）；版本控制：`git`（受控提交 + 只读 + add）；编排：`delegate`（受控子智能体）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签）`memory`（项目记忆）；汇报：`summary`（会话改动概览） |
+| 工具（共 30 个） | 文件：`read_file` `write_file` `edit_block` `list_dir` `read_many_files` `replace_in_file` `move_file` `copy_file` `delete` `replace_in_files`（跨文件替换）；检索：`grep_search`（支持 context 上下文）`find_files` `web_fetch` `recall`（相关文件检索）；执行：`run_command`（含后台 `check_command`/`kill_command`）；检查：`lint`（代码检查）；版本控制：`git`（受控提交 + 只读 + add）；编排：`delegate`（受控子智能体）；控制：`finish` `ask_user` `plan` `todo`（任务清单）`think`（推理便签）`memory`（项目记忆）；汇报：`summary`（会话改动概览） |
 | 双通道调用 | 优先原生 `tool_calls`；模型不支持时自动切到 ```json 文本协议 |
 | 上下文管理 | token 估算 → 工具回执智能压缩（信号行优先）→ 超阈值摘要压缩 → 硬截断兜底 |
 | 长程记忆 | **常驻事实层**：硬约束/技术选型/已失败方案常驻且不参与再压缩，避免"摘要的摘要"式衰减；压缩后重建工作区真实清单 |
@@ -120,6 +120,7 @@ AGENT_MODEL=Qwen3.5 AGENT_BASE_URL=... python run.py   # 环境变量临时覆�
 | 相关文件检索 | `recall` 给定一段模糊意图（如「登录失败重试」「导出 CSV」），按相关度排序找回最相关的若干文件并给出最相关的几行片段；模型不必知道确切函数名也能先定位（类比 Cursor/Claude Code 的 find relevant code），一轮内可与其他只读工具并行 |
 | 跨文件替换 | `replace_in_files` 按 glob 圈定一批文件，把某段文本（或正则）全部替换（仓库级符号重命名）；默认 `dry_run=true` 仅预览会动哪些文件/几处，确认后再落盘；写前逐文件备份可 /undo 回滚，二进制文件自动跳过 |
 | 子任务编排 | `delegate` 派发受控子智能体：大任务拆成可独立验证的小块、降低父任务上下文压力（类比 Claude Code 的 Task / Codex 子代理）。子智能体复用同一工作区与模型端点、拥有独立上下文与步数预算；**机制上杜绝递归**（剔除 `delegate`）、**不能反问用户**（剔除 `ask_user`）、关闭检查点/会话落盘写入避免污染父任务；其失败不拖垮父任务 |
+| 后台命令 | `run_command` 传 `background=true` 立即返回 `job_id` 不阻塞，之后用 `check_command(job_id)` 读实时输出、`kill_command(job_id)` 终止——可后台起开发服务器 / 跑长任务，边等边干别的（类比 Claude Code 的后台 shell） |
 | 代码检查 | `lint` 写完代码、finish 前先自查：不传 command 时对 Python 文件做零配置语法体检（内置 compile，纯标准库），传 command 时运行你给的检查器（如 `ruff check .`）并结构化解析 `文件:行: 信息`；只读护栏禁止 `--fix` 等改写选项，可据此逐条修复 |
 | 会话概览 | `summary` 把本次会话的改动整理成可粘贴的概览：哪些文件新建/修改/删除、各加减多少行、本次任务是什么，适合直接贴进 PR 描述 / 提交说明 / 交接；与 /diff（逐行 diff）、/stats（质量指标）三者互补 |
 

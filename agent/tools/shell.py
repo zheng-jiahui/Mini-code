@@ -64,17 +64,18 @@ def _resolve_timeout(raw: Any, config: Any) -> tuple:
 @tool_spec(
     name="run_command",
     description=(
-        "在工作区内执行一条 shell 命令（同步，带超时）。"
-        "用于运行测试、安装依赖、执行脚本、查看版本等。"
-        "命令应当是非交互式的：例如用 `pytest -q` 而不是等待输入的 `pytest`。"
-        "stdout 与 stderr 会合并返回，并附带退出码。"
+        "在工作区内执行一条 shell 命令（非交互式），stdout 与 stderr 合并返回并附带退出码。\n"
+        "用于运行测试、安装依赖、执行脚本、查看版本等。\n"
+        "两种模式：① 默认同步（带超时，命令结束才返回）；② 传 `background=true` 立即返回 job_id，"
+        "之后用 `check_command(job_id)` 读取输出、`kill_command(job_id)` 终止——适合起开发服务器 / 长任务。"
     ),
     parameters={
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "要执行的命令，如 `pytest -q`、`python main.py`"},
             "cwd": {"type": "string", "description": "执行目录，相对工作区，默认工作区根目录", "default": "."},
-            "timeout": {"type": "integer", "description": "超时秒数，默认取配置中的 command_timeout"},
+            "timeout": {"type": "integer", "description": "同步模式超时秒数，默认取配置中的 command_timeout"},
+            "background": {"type": "boolean", "description": "true=后台运行，立即返回 job_id，不等待命令结束"},
         },
         "required": ["command"],
     },
@@ -84,6 +85,7 @@ def _resolve_timeout(raw: Any, config: Any) -> tuple:
         "只是读写文件就用 read_file/write_file/edit_block，不必绕道 shell。"
         "不要跑交互式命令（等待输入的 REPL、需要确认的 `rm -i`）——会卡到超时；"
         "也不要用一条超长复合命令同时做验证和清理，拆开才能定位是哪一步挂了。"
+        "需要后台起服务/长任务时传 background=true，再用 check_command 读取，而非同步干等。"
     ),
 )
 def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -154,6 +156,23 @@ def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
             reader_done.set()
 
     threading.Thread(target=_reader, daemon=True).start()
+
+    # 后台模式：不等待命令结束，立刻登记 job 并返回 job_id，由 check_command/kill_command 管理生命周期。
+    if args.get("background"):
+        job_id = _next_job_id(ctx)
+        _bg_store(ctx)[job_id] = {
+            "proc": proc, "buf": buf, "reader_done": reader_done,
+            "started": time.time(), "command": command,
+            "cwd": str(ctx.guard.relpath(cwd)), "killed": False,
+        }
+        ctx.record_change("command", f"[后台] {command[:110]}")
+        return ToolResult.success(
+            f"已在后台启动（job_id={job_id}）。\n"
+            f"用 check_command(job_id=\"{job_id}\") 读取实时输出，"
+            f"用 kill_command(job_id=\"{job_id}\") 终止。\n"
+            f"$ {command}    (cwd={ctx.guard.relpath(cwd)})",
+            meta={"job_id": job_id, "background": True, "cwd": str(ctx.guard.relpath(cwd))},
+        )
 
     started = time.time()
     timed_out = False
@@ -239,6 +258,116 @@ def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     return result
 
 
+def _bg_store(ctx: ToolContext) -> Dict[str, Any]:
+    """返回后台任务登记表（挂在 ctx 上，不进入检查点序列化）。"""
+    jobs = getattr(ctx, "bg_jobs", None)
+    if jobs is None:
+        jobs = {}
+        ctx.bg_jobs = jobs
+    return jobs
+
+
+def _next_job_id(ctx: ToolContext) -> str:
+    n = getattr(ctx, "_bg_counter", 0) + 1
+    ctx._bg_counter = n
+    return f"bg{n}"
+
+
+@tool_spec(
+    name="check_command",
+    description=(
+        "读取一个后台命令（run_command 传 background=true 启动的）的当前输出与状态。\n"
+        "仍在运行则返回已产生的部分输出；已结束则返回完整输出与退出码。返回后任务仍保留，可再次调用。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string", "description": "run_command 后台模式返回的任务 id，如 `bg1`"},
+            "tail": {"type": "integer", "description": "仅返回末尾若干行（默认 30，0 表示全部）"},
+        },
+        "required": ["job_id"],
+    },
+    category="执行",
+    when_not_to_use=(
+        "只想跑完一条命令看结果，直接用同步 run_command 即可，不必先 background 再 check_command。"
+        "只有确实需要「启动后继续干别的、过会儿再回来看」的长任务/服务才用这一套。"
+    ),
+)
+def check_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    job_id = (args.get("job_id") or "").strip()
+    jobs = _bg_store(ctx)
+    job = jobs.get(job_id)
+    if job is None:
+        return ToolResult.failure(
+            f"未知的后台任务 id：`{job_id}`",
+            hint="请确认 job_id 来自最近一次 run_command(background=true) 的返回。",
+            meta={"job_id": job_id},
+        )
+    tail = int(args.get("tail") or 30)
+    proc: subprocess.Popen = job["proc"]
+    rc = proc.poll()
+    if rc is None:
+        raw = b"".join(job["buf"])
+        output = _decode_output(raw)
+        if tail and tail > 0 and output:
+            lines = output.splitlines()
+            output = "\n".join(lines[-tail:])
+        return ToolResult.success(
+            f"[后台任务 {job_id} 仍在运行]\n{output or '(暂无输出)'}",
+            meta={"job_id": job_id, "status": "running"},
+        )
+    # 已结束：等读线程收尾，拿全量输出
+    job["reader_done"].wait(timeout=3)
+    raw = b"".join(job["buf"])
+    output = _decode_output(raw)
+    if tail and tail > 0 and output:
+        lines = output.splitlines()
+        output = "\n".join(lines[-tail:])
+    status = "killed" if job.get("killed") else "done"
+    return ToolResult.success(
+        f"[后台任务 {job_id} 已{('终止' if job.get('killed') else '结束')} · exit code: {rc}]\n{output or '(无输出)'}",
+        meta={"job_id": job_id, "status": status, "exit_code": rc},
+    )
+
+
+@tool_spec(
+    name="kill_command",
+    description=(
+        "终止一个后台命令（run_command 传 background=true 启动的）。\n"
+        "用于停掉长时间运行的服务或卡住的命令。终止后可用 check_command 确认最终结果。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string", "description": "run_command 后台模式返回的任务 id，如 `bg1`"},
+        },
+        "required": ["job_id"],
+    },
+    category="执行",
+    when_not_to_use=(
+        "任务已经自己结束了，就不必 kill；只有确实需要提前停掉还在运行的后台命令时才用。"
+    ),
+)
+def kill_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    job_id = (args.get("job_id") or "").strip()
+    jobs = _bg_store(ctx)
+    job = jobs.get(job_id)
+    if job is None:
+        return ToolResult.failure(
+            f"未知的后台任务 id：`{job_id}`",
+            hint="请确认 job_id 来自最近一次 run_command(background=true) 的返回。",
+            meta={"job_id": job_id},
+        )
+    proc: subprocess.Popen = job["proc"]
+    if proc.poll() is None:
+        _kill_tree(proc)
+    job["killed"] = True
+    return ToolResult.success(
+        f"已终止后台任务 {job_id}（{job.get('command', '')}）。可用 check_command 确认结果。",
+        meta={"job_id": job_id, "status": "killed"},
+    )
+
+
 def _kill_tree(proc: subprocess.Popen) -> None:
     """尽可能杀掉进程及其子进程（shell=True 时子进程是 shell 的孩子）。"""
     try:
@@ -285,3 +414,5 @@ def _decode_output(raw: bytes) -> str:
 
 def register(registry) -> None:
     registry.register(run_command)
+    registry.register(check_command)
+    registry.register(kill_command)

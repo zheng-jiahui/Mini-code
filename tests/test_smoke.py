@@ -1178,6 +1178,67 @@ def test_run_command_survives_absurd_timeout_and_reports_partial_output():
         assert r.meta["timed_out"] is True
 
 
+def test_run_command_background_and_check_and_kill():
+    """后台命令：run_command(background=true) 立即返回 job_id，check_command 读输出，kill_command 终止。"""
+    import shutil as _shutil
+    import time as _t
+    d = tempfile.mkdtemp()
+    try:
+        cfg, profile, registry, ctx = _make_env(d)
+
+        # 1) 后台启动一个会很快结束的命令，立即拿到 job_id（不阻塞）
+        r = registry.execute("run_command", {
+            "command": 'python -c "print(\'HELLO_BG\')"',
+            "background": True,
+        }, ctx)
+        assert r.ok and r.meta.get("background") is True, r.render()
+        job_id = r.meta["job_id"]
+        assert job_id
+
+        # 2) 等命令结束后 check_command 拿到完整输出与退出码
+        for _ in range(50):
+            _t.sleep(0.1)
+            if registry.execute("check_command", {"job_id": job_id}, ctx).meta.get("status") == "done":
+                break
+        rc = registry.execute("check_command", {"job_id": job_id}, ctx)
+        assert rc.meta["status"] == "done", rc.render()
+        assert "HELLO_BG" in rc.output, "check_command 应拿到后台命令的完整输出"
+        assert rc.meta["exit_code"] == 0
+
+        # 3) 杀掉一个长任务：先后台起 sleep，再 kill
+        r2 = registry.execute("run_command", {
+            "command": "python -c \"import time; time.sleep(30)\"",
+            "background": True,
+        }, ctx)
+        jid2 = r2.meta["job_id"]
+        running = registry.execute("check_command", {"job_id": jid2}, ctx)
+        assert running.meta["status"] == "running"
+        killed = registry.execute("kill_command", {"job_id": jid2}, ctx)
+        assert killed.ok and killed.meta["status"] == "killed", killed.render()
+        jobs = getattr(ctx, "bg_jobs", {})
+        assert jobs[jid2]["proc"].poll() is not None, "kill_command 应真正终止进程"
+
+        # 4) 未知 job_id 报友好错误
+        bad = registry.execute("check_command", {"job_id": "bg999"}, ctx)
+        assert not bad.ok and "未知" in bad.error
+    finally:
+        # 后台进程若残留会锁住 cwd（Windows），先确保全部终止，再带重试地清理临时目录
+        jobs = getattr(ctx, "bg_jobs", {})
+        for j in jobs.values():
+            p = j["proc"]
+            if p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        for _ in range(10):
+            try:
+                _shutil.rmtree(d)
+                break
+            except OSError:
+                _t.sleep(0.3)
+
+
 def test_stats_panel_breaks_down_where_time_went():
     """「时间去向」必须把等模型的时间算进来，否则答不出瓶颈在哪。
 
