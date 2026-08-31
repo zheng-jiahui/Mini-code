@@ -20,6 +20,8 @@ start.py
 # ---- 运行时产物 ----
 .agent_backups/
 .agent_sessions/
+# Agent 跨会话记忆（memory / self_improve 落盘的项目记忆，属本地状态，不入库）
+.minicode/
 __pycache__/
 *.py[cod]
 .venv/
